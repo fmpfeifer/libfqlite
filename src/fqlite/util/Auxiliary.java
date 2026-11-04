@@ -1,13 +1,16 @@
 package fqlite.util;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.util.BitSet;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Set;
 
 import fqlite.base.Base;
 import fqlite.base.Global;
@@ -231,115 +234,62 @@ public class Auxiliary extends Base {
 		int pll = computePayloadLength(header);
 
 		int so;
-		so = computePayload(pll);
-
-		int overflow = -1;
+		so = computePayload(pll, false);
 
 		if (so < pll) {
 			int phl = header.length() / 2;
 
 			int last = buffer.position();
-			debug(" deleted spilled payload ::", so);
-			debug(" deleted pll payload ::", pll);
-			buffer.position(buffer.position() + so - phl - 1);
+			int localdata = so - phl - 1;
+			int ovfpos = last + localdata;
+			debug(" deleted spilled payload ::", so, " pll ", pll);
+			if (localdata < 0 || ovfpos + 4 > buffer.limit())
+				return null;
 
-			overflow = buffer.getInt();
-			debug(" deleted overflow::::::::: ", overflow, " ", Integer.toHexString(overflow));
-			buffer.position(last);
+			int overflow = buffer.getInt(ovfpos);
+			debug(" deleted overflow::::::::: ", overflow);
 
 			ByteBuffer bf;
-
 			/* is the overflow page value correct ? */
-			if (overflow > 0 && overflow  < job.numberofpages) {
-
-				/*
-				 * we need to increment page number by one since we start counting with zero for
-				 * page 1
-				 */
-				byte[] extended = readOverflowIterativ(overflow - 1);
-
-				byte[] c = BufferUtil.allocateByteBuffer(pll + job.ps);
-
-				buffer.position(0);
-				byte[] originalbuffer = BufferUtil.allocateByteBuffer(job.ps);
-				for (int bb = 0; bb < job.ps; bb++) {
-					originalbuffer[bb] = buffer.get(bb);
-				}
-
-				//buffer.position(last);
-
-                /* copy spilled overflow of current page into extended buffer */
-                //System.arraycopy(originalbuffer, buffer.position(), c, 0, so + 7);
-                /* append the rest startRegion the overflow pages to the buffer */
-                //System.arraycopy(extended, 0, c, so - phl -1, extended.length - so);
-                //bf = ByteBuffer.wrap(c);
-
-
-                buffer.position(last);
-                bf = null;
-
-                /* copy spilled overflow of current page into extended buffer */
-                System.arraycopy(originalbuffer, buffer.position(), c, 0, so + 7 );  // - phl
-                /* append the rest startRegion the overflow pages to the buffer */
-                try {
-                    if (null != extended)
-                        // copy every byte from extended (beginning with index 0) into byte-array c, at position so-phl
-                        System.arraycopy(extended, 0, c, so - phl - 1, pll - so);
-                        bf = ByteBuffer.wrap(c);
-                } catch (ArrayIndexOutOfBoundsException err) {
-                    info("Error IndexOutOfBounds");
-                } catch (NullPointerException err2) {
-                    info("Error NullPointer in ");
-                }
-
+			if (overflow > 0 && overflow <= job.numberofpages) {
+				bf = readSpilledPayload(buffer, last, localdata, overflow, pll - so);
 			} else {
-				pll = so;
-				bf = buffer;
+				/* use the part of the record stored on this page */
+				bf = readSpilledPayload(buffer, last, localdata, 0, 0);
 			}
-			bf.position(0);
 
-			/* start reading the content */
+			/* start reading the content - a broken overflow chain yields truncated values */
 			for (SqliteElement en : columns) {
 				if (en == null) {
+					row.append(new SqliteElementData(null, job.db_encoding));
 					continue;
 				}
-
-				byte[] value = BufferUtil.allocateByteBuffer(en.length);
-
+				byte[] value = BufferUtil.allocateByteBuffer(Math.min(en.length, bf.remaining()));
 				bf.get(value);
-
 				row.append(new SqliteElementData(en, value));
-
-				//co++;
 			}
 
 			// set original buffer pointer to the end of the spilled payload
-			// just before the next possible record
-			buffer.position(last + so - phl - 1);
+			// (including the overflow page number) just before the next possible record
+			buffer.position(ovfpos + 4);
 
 		} else {
 
 			for (SqliteElement en : columns) {
 
 				if (en == null) {
+					row.append(new SqliteElementData(null, job.db_encoding));
 					continue;
 				}
 
-				byte[] value = BufferUtil.allocateByteBuffer(en.length);
 				if ((buffer.position() + en.length) > buffer.limit()) {
-					error = true;
 					return null;
 				}
+				byte[] value = BufferUtil.allocateByteBuffer(en.length);
 				buffer.get(value);
 
 				row.append(new SqliteElementData(en, value));
-
-				//co++;
-
 			}
-
-			if (error)
-				return null;
 		}
 
 		/* mark bytes as visited */
@@ -424,7 +374,8 @@ public class Auxiliary extends Base {
 		// length of payload as varint
 		buffer.position(cellstart);
 		long lpll = readUnsignedVarInt(buffer);
-		if (lpll < 4 || lpll > Integer.MAX_VALUE)
+		/* the smallest record: header length + one serial type (e.g. a single NULL column) */
+		if (lpll < 2 || lpll > Integer.MAX_VALUE)
 			return null;
 		int pll = (int) lpll;
 		debug("Length of payload int : ", pll);
@@ -437,37 +388,36 @@ public class Auxiliary extends Base {
 			rowid = readUnsignedVarInt(buffer);
 		}
 
-		// now read the header length as varint
-		int phl = (int) readUnsignedVarInt(buffer);
+		// now read the header length as varint (the header length includes the varint itself)
+		int payloadstart = buffer.position();
+		long lhs = readUnsignedVarInt(buffer);
+		int varintlen = buffer.position() - payloadstart;
 
-		/* error handling - if header length is 0 */
-		if (phl == 0) {
+		/* error handling - the header must at least contain its own length and fit into the payload */
+		if (lhs <= varintlen || lhs > pll) {
 			return null;
 		}
+		int headersize = (int) lhs;
 
-		debug("Header Length int: ", phl, " as hex : ", Integer.toHexString(phl));
+		/* number of bytes with the serial types of the columns */
+		int phl = headersize - varintlen;
 
-		phl -= 1;
+		debug("Header Length int: ", headersize);
 
 		/*
 		 * maxlength field says something about the maximum bytes we can read before in
 		 * unallocated space, before we reach the cell content area (ppl + rowid header
 		 * + data). Note: Sometimes the data record is already partly overwritten by a
 		 * regular data record. We have only an artifact and not a complete data record.
-		 * 
+		 *
 		 * For a regular data field startRegion the content area the value of maxlength
 		 * should be INTEGER.max_value 2^32
 		 */
-		// System.out.println(" bufferposition :: " + buffer.position() + " headerlength
-		// " + phl );
-		maxlength = maxlength - phl; // - buffer.position();
+		maxlength = maxlength - phl;
 
 		// read header bytes with serial types for each column
 		// Attention: this takes most of the time during a run
 		SqliteElement[] columns;
-
-		if (phl <= 0)
-			return null;
 
 		int pp = buffer.position();
 		String hh = "";
@@ -475,7 +425,7 @@ public class Auxiliary extends Base {
 		    hh = getHeaderString(phl, buffer);
 		}
 		buffer.position(pp);
-		
+
 		columns = getColumns(phl, buffer, firstcol);
 
 		if (null == columns) {
@@ -483,203 +433,109 @@ public class Auxiliary extends Base {
 			return null;
 		}
 
-		int co = 0;
-		try {
-			if (unkown) {
-				
-				TableDescriptor td = matchTable(columns);
+		TableDescriptor tdesc = (known instanceof TableDescriptor) ? (TableDescriptor) known : null;
+		if (unkown) {
+			TableDescriptor td = matchTable(columns);
 
-				/* this is only neccessesary, when component name is unkown */
-				if (null == td)
-				    row.setTableName("__UNASSIGNED");
-				else {
-				    row.setTableName(td.tblname);
-				    if (pageInRange)
-				        job.pages[pagenumber_db] = td;
-				}
+			/* this is only neccessesary, when component name is unkown */
+			if (null == td)
+			    row.setTableName("__UNASSIGNED");
+			else {
+			    row.setTableName(td.tblname);
+			    if (pageInRange)
+			        job.pages[pagenumber_db] = td;
 			}
-		} catch (NullPointerException err) {
-			System.err.println(err);
+			tdesc = td;
 		}
 
-		boolean error = false;
+		/* the INTEGER PRIMARY KEY column is an alias for the rowid and is stored as NULL */
+		int rowidcol = withoutROWID ? -1 : rowidColumnIndex(tdesc);
 
-		int so = computePayload(pll);
+		/* end of the cell (to mark it as visited) */
+		int cellend;
 
-		int overflow = -1;
+		/* number of bytes of the payload stored on this page */
+		int so = computePayload(pll, pagetype == 10 || pagetype == 2);
 
-		if (so < pll) {
-			int last = buffer.position();
+		ByteBuffer bf;
+		boolean spilled = so < pll;
+
+		if (spilled) {
 			debug("regular spilled payload ::", so);
-			if ((buffer.position() + so - phl - 1) > (buffer.limit() - 4)) {
+			/* the number of the first overflow page follows the local part of the payload */
+			int ovfpos = payloadstart + so;
+			int localdata = so - headersize;
+			if (localdata < 0 || ovfpos + 4 > buffer.limit()) {
 				return null;
 			}
-			try {
-			    /* read overflow */
-			    buffer.position(buffer.position() + so - phl - 1);
-				overflow = buffer.getInt();
-			} catch (Exception err) {
+			int overflow = buffer.getInt(ovfpos);
+			if (overflow <= 0)
 				return null;
-			}
+			debug("regular overflow::::::::: ", overflow);
 
-			if (overflow < 0)
-				return null;
-			debug("regular overflow::::::::: ", overflow, " ", Integer.toHexString(overflow));
-			buffer.position(last);
-
-			/*
-			 * we need to increment page number by one since we start counting with zero for
-			 * page 1
-			 */
-			byte[] extended = readOverflowIterativ(overflow - 1);
-
-			byte[] c = BufferUtil.allocateByteBuffer(pll + job.ps);
-
-			buffer.position(0);
-			byte[] originalbuffer = BufferUtil.allocateByteBuffer(job.ps);
-			for (int bb = 0; bb < job.ps; bb++) {
-				originalbuffer[bb] = buffer.get(bb);
-			}
-
-			buffer.position(last);
-			/* copy spilled overflow of current page into extended buffer */
-			
-			// original code was:
-			// System.arraycopy(originalbuffer, buffer.position(), c, 0, so + 7 ); // - phl
-			// I'm getting ArrayIndexOutOfBoundsException
-			// So try to limit the amount to copy to the available data and target capacity
-			int lenToCopy = so + 7;
-			if (lenToCopy > c.length) {
-			    lenToCopy = c.length;
-			}
-			if (lenToCopy > originalbuffer.length - buffer.position()) {
-			    lenToCopy = originalbuffer.length - buffer.position();
-			}
-			System.arraycopy(originalbuffer, buffer.position(), c, 0, lenToCopy ); // - phl
-			
-			/* append the rest startRegion the overflow pages to the buffer */
-			try {
-				if (null != extended) {
-				    // copy every byte from extended (beginning with index 0) into byte-array c, at position so-phl
-                    System.arraycopy(extended, 0, c, so - phl - 1, pll - so);
-				}
-			} catch (ArrayIndexOutOfBoundsException err) {
-				err("Error IndexOutOfBounds");
-			} catch (NullPointerException err2) {
-				err("Error NullPointer in ");
-			}
-
-			/* now we have the complete overflow in one byte-array */
-			ByteBuffer bf = ByteBuffer.wrap(c);
-			bf.position(0);
-
-			co = 0;
-			/* start reading the content of each column */
-			for (SqliteElement en : columns) {
-				if (en == null) {
-					//lineUTF.append(";NULL");
-				    //row.append(new SqliteElementData(null, job.db_encoding));
-					continue;
-				}
-
-				if (!withoutROWID && co == 0 && en.length == 0) {
-				    row.append(new SqliteElementData(en, rowid));
-				} else if (en.length == 0) {
-				    if (en.type == SerialTypes.INT0) {
-				        row.append(new SqliteElementData(en, 0));
-				    } else {
-				        row.append(new SqliteElementData(null, job.db_encoding));
-				    }
-				} else {
-				    int len = en.length;
-				    
-
-				    if ((bf.limit() - bf.position()) < len) {
-				        info(" Bufferunderflow ", (bf.limit() - bf.position()), " is lower than", len);
-				        len = bf.limit() - bf.position();
-				    }
-
-				    try {
-				        if (len>0) {
-				            byte[] value = BufferUtil.allocateByteBuffer(len);
-	                        bf.get(value);
-	                        row.append(new SqliteElementData(en, value));
-				        } else {
-				            row.append(new SqliteElementData(null, job.db_encoding)); 
-				        }
-				        
-				        //lineUTF.append(write(co, en, value));
-
-				    } catch (java.nio.BufferUnderflowException bue) {
-						row.append(new SqliteElementData(null, job.db_encoding));
-    					err("readRecord():: overflow java.nio.BufferUnderflowException");
-    				}
-				}
-
-				co++;
-			}
-
-			// set original buffer pointer to the end of the spilled payload
-			// just before the next possible record
-			//buffer.position(last + so - phl - 1);
-
+			/* now we have the complete payload data in one buffer */
+			bf = readSpilledPayload(buffer, buffer.position(), localdata, overflow, pll - so);
+			cellend = ovfpos + 4;
 		} else {
-			/*
-			 * record is not spilled over different pages - no overflow, just a regular
-			 * record
-			 *
-			 * start reading the content
-			 */
-			co = 0;
+			bf = buffer;
+			cellend = -1;
+		}
 
-			/*
-			 * there is a max length set - because we are in the unallocated space and may
-			 * not read beyond the content area start
-			 */
-			for (SqliteElement en : columns) {
-				if (en == null) {
-					//lineUTF.append(";");
-				    row.append(new SqliteElementData(null, job.db_encoding));
-					continue;
-				}
-
-				if (!withoutROWID && co == 0 && en.length == 0) {
-                    row.append(new SqliteElementData(en, rowid));
-                } else if (en.length == 0) {
-                    if (en.type == SerialTypes.INT0) {
-                        row.append(new SqliteElementData(en, 0));
-                    } else {
-                        row.append(new SqliteElementData(null, job.db_encoding));
-                    }
-                } else {
-
-    				byte[] value = null;
-    				if (maxlength >= en.length)
-    					value = BufferUtil.allocateByteBuffer(en.length);
-    				else if (maxlength > 0)
-    					value = BufferUtil.allocateByteBuffer(maxlength);
-    				maxlength -= en.length;
-    
-    				if (null == value)
-    					break;
-    
-    				try {
-    					buffer.get(value);
-    				} catch (BufferUnderflowException err) {
-    					info("readRecord():: no overflow ERROR ", err);
-    					// err.printStackTrace();
-    					return null;
-    				}
-    
-   				    row.append(new SqliteElementData(en, value));
-                }
-
-				co++;
-
-				if (maxlength <= 0)
-					break;
+		/* start reading the content of each column */
+		int co = 0;
+		for (SqliteElement en : columns) {
+			if (en == null) {
+				/* reserved serial type */
+			    row.append(new SqliteElementData(null, job.db_encoding));
+			    co++;
+				continue;
 			}
 
+			if (co == rowidcol && en.length == 0 && en.type == SerialTypes.PRIMARY_KEY) {
+			    row.append(new SqliteElementData(en, rowid));
+			} else if (en.type == SerialTypes.INT0) {
+			    row.append(new SqliteElementData(en, 0));
+			} else if (en.type == SerialTypes.INT1) {
+			    row.append(new SqliteElementData(en, 1));
+			} else if (en.length == 0) {
+			    row.append(new SqliteElementData(null, job.db_encoding));
+			} else if (spilled) {
+			    /* a truncated overflow chain yields truncated values */
+			    int len = Math.min(en.length, bf.remaining());
+			    if (len > 0) {
+			        byte[] value = BufferUtil.allocateByteBuffer(len);
+			        bf.get(value);
+			        row.append(new SqliteElementData(en, value));
+			    } else {
+			        row.append(new SqliteElementData(null, job.db_encoding));
+			    }
+			} else {
+			    /*
+			     * there may be a max length set - because we are in the unallocated space and may
+			     * not read beyond the content area start
+			     */
+				byte[] value = null;
+				if (maxlength >= en.length)
+					value = BufferUtil.allocateByteBuffer(en.length);
+				else if (maxlength > 0)
+					value = BufferUtil.allocateByteBuffer(maxlength);
+				maxlength -= en.length;
+
+				if (null == value)
+					break;
+
+				if (buffer.remaining() < value.length) {
+					debug("readRecord():: record exceeds the page");
+					return null;
+				}
+				buffer.get(value);
+			    row.append(new SqliteElementData(en, value));
+			}
+
+			co++;
+
+			if (!spilled && maxlength <= 0)
+				break;
 		}
 
 		/* append header match string at the end */
@@ -687,18 +543,52 @@ public class Auxiliary extends Base {
 		    row.setLineSuffix("##header##" + hh);
 		}
 
-		//lineUTF.append("\n");
-
 		/* mark as visited */
-		debug("visted ", cellstart, " to ", buffer.position());
-		bs.set(cellstart, buffer.position());
+		if (cellend < 0)
+			cellend = buffer.position();
+		debug("visted ", cellstart, " to ", cellend);
+		bs.set(cellstart, Math.max(cellstart, cellend));
 
-		if (error) {
-			err("spilles overflow page error ...");
-			return null;
-		}
 		debug(row);
 		return row;
+	}
+
+	/**
+	 * Determine the index of the column, which is an alias for the rowid (INTEGER PRIMARY KEY).
+	 *
+	 * @param td the table descriptor or null if the table is unknown
+	 * @return the index of the column or -1 if there is no such column
+	 */
+	private static int rowidColumnIndex(TableDescriptor td) {
+		/* unknown table layout: assume the usual 'id INTEGER PRIMARY KEY' as first column */
+		if (td == null || td.tblname.startsWith("__UNASSIGNED"))
+			return 0;
+		if (td.rowidcolumn == null || td.columnnames == null)
+			return -1;
+		return td.columnnames.indexOf(td.rowidcolumn);
+	}
+
+	/**
+	 * Assemble the data part of a record payload that spilled onto overflow pages.
+	 *
+	 * @param page          the b-tree page holding the start of the record
+	 * @param datastart     offset of the first data byte (after the record header) in the page
+	 * @param localdata     number of data bytes stored on the page
+	 * @param overflowpage  number of the first overflow page (starting with 1)
+	 * @param remaining     number of payload bytes stored on overflow pages
+	 * @return a buffer with the data bytes; it is shorter than expected if the overflow chain is broken
+	 * @throws IOException if an I/O error occurs
+	 */
+	private ByteBuffer readSpilledPayload(ByteBuffer page, int datastart, int localdata, int overflowpage, int remaining)
+			throws IOException {
+		int local = Math.max(0, Math.min(localdata, page.limit() - datastart));
+		byte[] extended = readOverflow(overflowpage, remaining);
+		byte[] data = BufferUtil.allocateByteBuffer(local + extended.length);
+		for (int i = 0; i < local; i++) {
+			data[i] = page.get(datastart + i);
+		}
+		System.arraycopy(extended, 0, data, local, extended.length);
+		return ByteBuffer.wrap(data);
 	}
 
 	private TableDescriptor matchTable(SqliteElement[] header) {
@@ -736,7 +626,7 @@ public class Auxiliary extends Base {
 	}
 	
 	/**
-     * Reads the specified page as overflow.
+     * Reads the content of a chain of overflow pages.
      * 
      * Background: When the payload of a record is to large, it is spilled onto
      * overflow pages. Overflow pages form a linked list. The first four bytes of
@@ -744,69 +634,39 @@ public class Auxiliary extends Base {
      * next page in the chain, or zero for the final page in the chain. The fifth
      * byte through the last usable byte are used to hold overflow content.
      * 
-     * @param pagenumber
-     * @return
-     *
+     * The chain is followed until the needed number of bytes was read, the chain
+     * ends, it points outside the database or a page is visited twice (cycle).
+     * 
+     * @param firstpage number of the first overflow page (starting with 1)
+     * @param needed    number of payload bytes stored on the overflow pages
+     * @return the overflow content (shorter than needed if the chain is broken)
      */
-    private byte[] readOverflowIterativ(int pagenumber) throws IOException
+    private byte[] readOverflow(int firstpage, int needed) throws IOException
     {
-        List<ByteBuffer> parts = new LinkedList<ByteBuffer>();
-        boolean more = true;
-        ByteBuffer overflowpage = null;
-        int next = pagenumber;
-
-
-        while(more)
-        {
-            info("before Read() ", next);
-            /* read next overflow page into buffer */
-            overflowpage = job.readPageWithNumber(next, job.ps);
-
-            if (overflowpage != null) {
-                overflowpage.position(0);
-                next = overflowpage.getInt()-1;
-                info(" next overflow:: ", next);
-            } 
-            else {
-                more = false;
+        int chunk = job.getUsablePageSize() - 4;
+        if (needed <= 0 || chunk <= 0) {
+            return new byte[0];
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream(Math.min(needed, 1 << 20));
+        Set<Integer> visited = new HashSet<>();
+        int next = firstpage;
+        while (next > 0 && next <= job.numberofpages && out.size() < needed && visited.add(next)) {
+            ByteBuffer overflowpage = job.readPageWithNumber(next - 1, job.ps);
+            if (overflowpage == null) {
                 break;
-            }       
-
-
-            /*
-             * we always crab the complete overflow-page minus the first four bytes - they
-             * are reserved for the (possible) next overflow page offset
-             **/
-            byte[] current = BufferUtil.allocateByteBuffer(job.ps - 4);
-            overflowpage.position(4);
-            overflowpage.get(current, 0, job.ps - 4);
-            // Wrap a byte array into a buffer
-            ByteBuffer part = ByteBuffer.wrap(current);
-            parts.add(part);
-
-            if (next < 0 || next > job.numberofpages) {
-                // termination condition for the recursive callup's
-                debug("No further overflow pages");
-                /* startRegion the last overflow page - do not copy the zero bytes. */
-                more = false;
             }
-
+            int following = overflowpage.getInt(0);
+            int len = Math.min(chunk, needed - out.size());
+            byte[] current = new byte[len];
+            overflowpage.position(4);
+            overflowpage.get(current);
+            out.write(current, 0, len);
+            next = following;
         }
-
-        /* try to merge all the ByteBuffers into one array */
-        if (parts == null || parts.size() == 0) {
-            return ByteBuffer.allocate(0).array();
-        } 
-        else if (parts.size() == 1) {
-            return parts.get(0).array();
-        } 
-        else {
-            ByteBuffer fullContent = ByteBuffer.allocate(parts.stream().mapToInt(Buffer::capacity).sum());
-            parts.forEach(fullContent::put);
-            fullContent.flip();
-            return fullContent.array();     
+        if (next > 0 && out.size() < needed && visited.contains(next)) {
+            warning("Cycle in overflow page chain at page ", next);
         }
-
+        return out.toByteArray();
     }
 
 	/**
@@ -1036,43 +896,38 @@ public class Auxiliary extends Base {
 	}
 
 	/**
-	 * Computes the amount of payload that spills onto overflow pages.
+	 * Computes the amount of payload that is stored on the b-tree page (the rest
+	 * spills onto overflow pages).
 	 * 
 	 * @param p Payload size
-	 * @return
+	 * @param indexPage true for pages of an index b-tree (and WITHOUT ROWID tables)
+	 * @return number of payload bytes stored on the b-tree page
 	 */
-	private int computePayload(int p) {
+	private int computePayload(int p, boolean indexPage) {
 
 		// let U is the usable size of a database page,
 		// the total page size less the reserved space at the end of each page.
-		int u = job.ps;
+		int u = job.getUsablePageSize();
 		// x represents the maximum amount of payload that can be stored directly
-		int x = u - 35;
+		int x = indexPage ? ((u - 12) * 64 / 255) - 23 : u - 35;
 		// m represents the minimum amount of payload that must be stored on the btree
-		// page
-		// before spilling is allowed
+		// page before spilling is allowed
 		int m = ((u - 12) * 32 / 255) - 23;
-
-		int k = m + ((p - m) % (u - 4));
-		
-		info("p ", p);
-        info("k ", k);
-        info("m ", m);
 
 		// case 1: all P bytes of payload are stored directly on the btree page without
 		// overflow.
 		if (p <= x)
 			return p;
+
+		int k = m + ((p - m) % (u - 4));
+
 		// case 2: first K bytes of P are stored on the btree page and the remaining P-K
 		// bytes are stored on overflow pages.
-		if ((p > x) && (k <= x))
+		if (k <= x)
 			return k;
 		// case 3: then the first M bytes of P are stored on the btree page and the
 		// remaining P-M bytes are stored on overflow pages.
-		if ((p > x) && (k > x))
-			return m;
-
-		return p;
+		return m;
 	}
 
 	/**

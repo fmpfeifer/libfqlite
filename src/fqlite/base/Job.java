@@ -1105,6 +1105,14 @@ public class Job extends Base {
 
 	}
 
+	/**
+	 * @return the usable size of a database page, i.e. the page size minus the
+	 *         reserved space at the end of each page
+	 */
+	public int getUsablePageSize() {
+		return ps - (reservedspace & 0xFF);
+	}
+
 	public void setPath(String path) {
 		this.path = path;
 	}
