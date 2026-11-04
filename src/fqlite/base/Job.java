@@ -224,6 +224,13 @@ public class Job extends Base {
 
 	public boolean recoverOnlyDeletedRecords = false;
 
+	/**
+	 * B-tree balancing leaves copies of current records in the free space of pages. By
+	 * default such copies (same table and values as a current record) are not reported as
+	 * deleted records. Set to true to report them.
+	 */
+	public boolean keepCopiesOfLiveRecords = false;
+
 	public SQLiteSchemaParser schemaParser = new SQLiteSchemaParser();
 	
 	private Object lock = new Object();
@@ -743,13 +750,11 @@ public class Job extends Base {
 			unassignedTableCreated(tdefault);
 
 			/*
-			 * With a WAL or rollback journal file, the records are collected first: the
-			 * current version of each page is only known after reading these files
+			 * The records are collected first: the current version of each page is only known
+			 * after reading the WAL and journal files, and deleted records which are copies of
+			 * current records are only known when all records were read
 			 */
-			if ((readWAL && isNonEmptyFile(walpath != null ? walpath : path + "-wal", 32))
-					|| (readRollbackJournal && isNonEmptyFile(rollbackjournalpath != null ? rollbackjournalpath : path + "-journal", 512))) {
-				collectedRows = new ConcurrentLinkedQueue<>();
-			}
+			collectedRows = new ConcurrentLinkedQueue<>();
 			/*******************************************************************/
 
 			byte freepageno[] = new byte[4];
@@ -1534,6 +1539,7 @@ public class Job extends Base {
         }
 
         Set<String> reported = new HashSet<>();
+        List<SqliteInternalRow> result = new ArrayList<>(rows.size());
         for (SqliteInternalRow row : rows) {
             if (old.contains(row)) {
                 String key = recordKey(row);
@@ -1542,8 +1548,60 @@ public class Job extends Base {
                     continue;
                 row.setRecordType(Global.DELETED_RECORD_IN_PAGE + row.getRecordType());
             }
+            result.add(row);
+        }
+
+        /* the values (and rowids) of the current records, to detect copies of them */
+        Map<String, Set<Long>> live = new HashMap<>();
+        if (!keepCopiesOfLiveRecords) {
+            for (SqliteInternalRow row : result) {
+                if (!row.isDeletedRow()) {
+                    String key = contentKey(row);
+                    if (key != null)
+                        live.computeIfAbsent(key, k -> new HashSet<>()).add(row.getRowId());
+                }
+            }
+        }
+        for (SqliteInternalRow row : result) {
+            if (!live.isEmpty() && row.isDeletedRow() && isCopyOfLiveRecord(row, live))
+                continue;
             addRowNow(row);
         }
+    }
+
+    /**
+     * Key of the values of a record without the rowid (and the column alias for the rowid,
+     * which is usually lost for carved records), null if the record has less than two values.
+     */
+    private String contentKey(SqliteInternalRow row) {
+        int alias = -1;
+        TableDescriptor td = headers.get(row.getTableName());
+        if (td != null && td.rowidcolumn != null)
+            alias = td.columnnames.indexOf(td.rowidcolumn);
+        StringBuilder sb = new StringBuilder(row.getTableName());
+        int values = 0;
+        List<SqliteElementData> data = row.getRowData();
+        for (int i = 0; i < data.size(); i++) {
+            if (i == alias)
+                continue;
+            SqliteElementData d = data.get(i);
+            Object o = d == null ? null : d.getObject(false);
+            if (o != null)
+                values++;
+            sb.append(' ').append(d == null ? "" : d.toString());
+        }
+        return values < 2 ? null : sb.toString();
+    }
+
+    /** A deleted record with the values of a current record (and the same rowid, if it is known). */
+    private boolean isCopyOfLiveRecord(SqliteInternalRow row, Map<String, Set<Long>> live) {
+        String key = contentKey(row);
+        if (key == null)
+            return false;
+        Set<Long> rowids = live.get(key);
+        if (rowids == null)
+            return false;
+        return row.getRowId() == Long.MIN_VALUE || rowids.contains(row.getRowId());
     }
 
     public void addRow(SqliteInternalRow row) {

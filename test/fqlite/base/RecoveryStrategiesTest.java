@@ -115,6 +115,46 @@ public class RecoveryStrategiesTest {
         assertEquals(2250, TestSupport.countRegular(job, "kv"));
     }
 
+    /** Copies of current records left in free space by b-tree balancing are no deleted records. */
+    @Test
+    public void copiesOfLiveRecordsAreNotReportedAsDeleted() throws Exception {
+        Path db = TestSupport.createDb(tmp.getRoot().toPath(), "copies.db", c -> {
+            TestSupport.exec(c, "PRAGMA secure_delete=OFF",
+                    "CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT, n INTEGER) WITHOUT ROWID");
+            c.setAutoCommit(false);
+            /* random insertion order: many page splits */
+            java.util.List<Integer> ids = new java.util.ArrayList<>();
+            for (int i = 1; i <= 3000; i++) {
+                ids.add(i);
+            }
+            java.util.Collections.shuffle(ids, new java.util.Random(1));
+            for (int i : ids) {
+                TestSupport.exec(c, "INSERT INTO kv VALUES('" + String.format("key-%06d", i) + "', '" + body(i, 20 + i % 100)
+                        + "', " + i + ")");
+            }
+            c.commit();
+        });
+        Job job = TestSupport.run(db);
+        assertEquals(3000, TestSupport.countRegular(job, "kv"));
+        Set<String> live = new HashSet<>();
+        for (SqliteRow r : job.getRowsForTable("kv")) {
+            if (!r.isDeletedRow()) {
+                live.add(r.toString());
+            }
+        }
+        for (SqliteRow r : job.getRowsForTable("kv")) {
+            if (r.isDeletedRow()) {
+                assertFalse("copy of a live record reported as deleted: " + r, live.contains(r.toString()));
+            }
+        }
+
+        Job all = new Job();
+        all.keepCopiesOfLiveRecords = true;
+        assertEquals(0, all.run(db.toString()));
+        long copies = all.getRowsForTable("kv").stream().filter(r -> r.isDeletedRow() && live.contains(r.toString())).count();
+        assertTrue("copies left by page splits: " + copies, copies > 0);
+    }
+
     /** Pages of a table whose schema entry was destroyed are not referenced by any b-tree. */
     @Test
     public void pagesWithoutSchema() throws Exception {
