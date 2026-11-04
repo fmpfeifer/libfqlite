@@ -125,7 +125,8 @@ public class Auxiliary extends Base {
 		for (SqliteElement en : columns) {
 
 			if (en == null) {
-				continue;
+				/* reserved serial type - this is no valid sqlite_master record */
+				return false;
 			}
 
 			byte[] value = BufferUtil.allocateByteBuffer(en.length);
@@ -138,7 +139,7 @@ public class Auxiliary extends Base {
 			{
 				return false;
 			}
-			
+
 			/* column 2 ? -> tbl_name TEXT */
 			if (con == 2) {
 				tablename = en.toString(value);
@@ -146,10 +147,13 @@ public class Auxiliary extends Base {
 
 			/* column 3 ? -> root page Integer */
 			if (con == 3) {
-				if (value.length == 0)
+				if (value.length == 0 && en.type != SerialTypes.INT0 && en.type != SerialTypes.INT1)
 					debug("Seems to be a virtual component -> no root page ;)");
 				else {
-					rootpage = SqliteElement.decodeInt8(value[0]);
+					/* the root page can be stored with any integer serial type (1 to 4 bytes) */
+					long root = new SqliteElementData(en, value).getIntValue();
+					if (root > 0 && root <= Integer.MAX_VALUE)
+						rootpage = (int) root;
 				}
 			}
 
