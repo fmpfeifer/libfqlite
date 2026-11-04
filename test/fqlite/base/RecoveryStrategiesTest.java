@@ -151,6 +151,43 @@ public class RecoveryStrategiesTest {
         assertFalse(job.getTablesNames().contains("idx_sender"));
     }
 
+    /**
+     * A record updated with a shorter value: the new cell is written at the end of the freed
+     * space, overwriting the end of the former record. The former value is recovered up to the
+     * overwritten part (no bytes of the new cell), and the record is marked as truncated.
+     */
+    @Test
+    public void formerValuesOfUpdatedRecordsWithoutForeignBytes() throws Exception {
+        Path db = TestSupport.createDb(tmp.getRoot().toPath(), "upd.db", c -> {
+            TestSupport.exec(c, "PRAGMA secure_delete=OFF", "CREATE TABLE msgs(id INTEGER PRIMARY KEY, body TEXT)");
+            c.setAutoCommit(false);
+            for (int i = 1; i <= 1000; i++) {
+                TestSupport.exec(c, "INSERT INTO msgs VALUES(" + i + ", 'msg-" + i + "- " + TestSupport.repeat('x', 100) + "')");
+            }
+            c.commit();
+            c.setAutoCommit(true);
+            TestSupport.exec(c, "UPDATE msgs SET body = 'changed' WHERE id % 10 = 0");
+        });
+        Job job = TestSupport.run(db);
+        assertEquals(1000, TestSupport.countRegular(job, "msgs"));
+        Pattern valid = Pattern.compile("msg-([0-9]+)- x*");
+        Set<Integer> former = new HashSet<>();
+        boolean truncated = false;
+        for (SqliteRow r : job.getRowsForTable("msgs")) {
+            String body = r.getTextValue("body");
+            if (!r.isDeletedRow() || body == null || !body.startsWith("msg-"))
+                continue;
+            Matcher m = valid.matcher(body);
+            assertTrue("bytes of an other record in: " + body, m.matches());
+            former.add(Integer.parseInt(m.group(1)));
+            truncated |= r.isTruncated();
+        }
+        for (int i = 10; i <= 1000; i += 10) {
+            assertTrue("former value of " + i, former.contains(i));
+        }
+        assertTrue(truncated);
+    }
+
     /** Copies of current records left in free space by b-tree balancing are no deleted records. */
     @Test
     public void copiesOfLiveRecordsAreNotReportedAsDeleted() throws Exception {

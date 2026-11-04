@@ -13,6 +13,19 @@ public class SqliteRow {
     private Charset charset = StandardCharsets.UTF_8;
     private RecordSource source = RecordSource.DATABASE;
     private long offset = 0L;
+    private boolean truncated = false;
+
+    /**
+     * @return true, if the end of this (deleted) record was overwritten: its last values are
+     *         cut or NULL
+     */
+    public boolean isTruncated() {
+        return truncated;
+    }
+
+    void setTruncated(boolean truncated) {
+        this.truncated = truncated;
+    }
 
     /**
      * @return the file this record was read from

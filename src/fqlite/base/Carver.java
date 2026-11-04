@@ -157,7 +157,12 @@ public class Carver extends Base {
 					if (pageFileOffset < 0 && pagenumber >  job.numberofpages)
 						continue;
 					
-					CarvingResult res = c.readDeletedRecord(job, end, block, m, bs, pagenumber);
+					/*
+					 * the record must lie in the free region, otherwise it was (partly) overwritten
+					 * (a region reaching the end of the page ends one byte before it in findGaps)
+					 */
+					int regionEnd = (toidx + 2 >= block.limit()) ? block.limit() : toidx + 1;
+					CarvingResult res = c.readDeletedRecord(job, end, block, m, bs, pagenumber, regionEnd);
 
 					if (null == res)
 					{

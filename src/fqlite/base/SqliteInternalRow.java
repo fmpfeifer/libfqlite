@@ -14,6 +14,7 @@ public class SqliteInternalRow {
     private String lineSuffix = "";
     private RecordSource source = RecordSource.DATABASE;
     private long rowid = Long.MIN_VALUE;
+    private boolean truncated = false;
     private Map<String, Integer> colIdx = null;
 
     void setColumnNamesMap(Map<String, Integer> colIdx) {
@@ -79,6 +80,17 @@ public class SqliteInternalRow {
      * @return the rowid read from the cell, Long.MIN_VALUE if unknown (WITHOUT ROWID tables,
      *         indices and carved records)
      */
+    /**
+     * @return true, if the end of the record was overwritten: the last values are cut or NULL
+     */
+    public boolean isTruncated() {
+        return truncated;
+    }
+
+    public void setTruncated(boolean truncated) {
+        this.truncated = truncated;
+    }
+
     public long getRowId() {
         return rowid;
     }
@@ -179,6 +191,7 @@ public class SqliteInternalRow {
         result.setDeletedRow(isDeletedRow());
         result.setColumnNamesMap(colIdx);
         result.setSource(source);
+        result.setTruncated(truncated);
         result.setOffset(offset);
         Object [] data = new Object[rowData.size()];
         Object [] raw = null;
