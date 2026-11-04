@@ -414,18 +414,21 @@ public abstract class RollbackJournalReaderBase extends Base {
 			buffer.position(Math.min(headerend, buffer.limit()));
 
 			/* skip pointers of deleted records behind the official cell pointer array */
+			/* the unallocated area ends where the cell content area starts - never read into the cells */
+			int unallocatedEnd = Math.min(ccrstart, ps);
+
 			byte garbage[] = new byte[2];
 			int garbageoffset;
 			do {
-				if (buffer.remaining() < 2)
+				if (buffer.remaining() < 2 || buffer.position() + 2 > unallocatedEnd)
 					break;
 				buffer.get(garbage);
 				garbageoffset = Auxiliary.TwoByteBuffertoInt(garbage);
-			} while (buffer.position() < ps && garbageoffset > 0);
+			} while (buffer.position() < unallocatedEnd && garbageoffset > 0);
 
 			/* skip all zeros - no information to recover just empty space */
 			byte zerob = 0;
-			while (buffer.position() < ps && zerob == 0) {
+			while (buffer.position() < unallocatedEnd && zerob == 0) {
 				zerob = buffer.get();
 			}
 			visit.set(headerend, buffer.position());

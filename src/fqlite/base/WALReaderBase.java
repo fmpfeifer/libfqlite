@@ -649,23 +649,26 @@ public abstract class WALReaderBase extends Base {
 		 *  artifacts in the unallocated space. 
 		 */
 		
+		/* the unallocated area ends where the cell content area starts - never read into the cells */
+		int unallocatedEnd = Math.min(ccrstart, ps);
+
 		byte garbage[] = new byte[2];
 		
 		int garbageoffset = -1;
 		do
 		{
-			if (buffer.remaining() < 2)
+			if (buffer.remaining() < 2 || buffer.position() + 2 > unallocatedEnd)
 				break;
 			buffer.get(garbage);
 			ByteBuffer ignore = ByteBuffer.wrap(garbage);
 			garbageoffset = Auxiliary.TwoByteBuffertoInt(ignore);
 			//System.out.println("garbage bytes " + buffer.position());
-		} while (buffer.position() < ps && garbageoffset > 0);
+		} while (buffer.position() < unallocatedEnd && garbageoffset > 0);
 		
 		
 		/*  Now, skip all zeros - no information to recover just empty space */
 		byte zerob = 0;
-		while(buffer.position() < ps && zerob == 0)
+		while (buffer.position() < unallocatedEnd && zerob == 0)
 		{
 			zerob = buffer.get();
 		}
