@@ -1287,13 +1287,18 @@ public class Auxiliary extends Base {
     
     private static final int[] FALSE_INT_ARRAY_RESP = new int[] {Integer.MIN_VALUE, Integer.MIN_VALUE};
     
-    private int[] validateHeaderBytes(byte[] headerBytes, int start) {
+    private int[] validateHeaderBytes(byte[] headerBytes, int start, int typeLength) {
         int size = headerBytes[start] - 1;
-        if (size < headerBytes.length - start) {
+        if (size > 0 && size < headerBytes.length - start) {
             byte[] headerCols = new byte[size];
             System.arraycopy(headerBytes, start + 1, headerCols, 0, size);
             SqliteElement[] cols = convertHeaderToSqliteElements(headerCols, job.db_encoding);
             if (cols != null) {
+                /* the first column (type) holds the text 'table' or 'index' */
+                if (typeLength > 0 && (cols.length == 0 || cols[0] == null || cols[0].type != SerialTypes.STRING
+                        || cols[0].length != typeLength)) {
+                    return FALSE_INT_ARRAY_RESP;
+                }
                 return new int[] {cols.length, size};
             }
         }
@@ -1309,12 +1314,25 @@ public class Auxiliary extends Base {
      * @return int[] first element - start of the header, second element - size of header
      */
     public int[] validateIntactMasterTableHeader(byte[] headerBytes, int start, int end) {
-        for (int i = 0; i < 6; i++) {
+        return validateIntactMasterTableHeader(headerBytes, start, end, -1);
+    }
+
+    /**
+     * Verify if the bytes form a valid header of a record for the master table
+     * 
+     * @param headerBytes the header bytes
+     * @param start position of first byte to be read in buffer
+     * @param end end of the header bytes
+     * @param typeLength length in bytes of the text in the type column ('table' or 'index'), -1 to skip this check
+     * @return int[] first element - start of the header, second element - size of header
+     */
+    public int[] validateIntactMasterTableHeader(byte[] headerBytes, int start, int end, int typeLength) {
+        for (int i = 0; i < 6 && i + start < headerBytes.length; i++) {
             int firstByte = headerBytes[i+start];
             if (firstByte >= 6 && firstByte <= 9) {
                 if (start + i + firstByte != end)
                     continue;
-                int [] valData = validateHeaderBytes(headerBytes, i+start);
+                int [] valData = validateHeaderBytes(headerBytes, i+start, typeLength);
                 int numCols = valData[0];
                 int sizeHeader = valData[1];
                 if (numCols == 5) {
@@ -1344,12 +1362,24 @@ public class Auxiliary extends Base {
      * @return int[] first element - start of the header, second element - size of header
      */
     public int[] validateOverwrittenMasterTableHeader(byte[] headerBytes, int end) {
+        return validateOverwrittenMasterTableHeader(headerBytes, end, -1);
+    }
+
+    /**
+     * Verify if the bytes form a valid header of a partially overwritten record for the master table
+     * 
+     * @param headerBytes the header bytes
+     * @param end end of the header bytes
+     * @param typeLength length in bytes of the text in the type column ('table' or 'index'), -1 to skip this check
+     * @return int[] first element - start of the header, second element - size of header
+     */
+    public int[] validateOverwrittenMasterTableHeader(byte[] headerBytes, int end, int typeLength) {
         byte [] headerBytesExtended = new byte[headerBytes.length + 1];
         System.arraycopy(headerBytes, 0, headerBytesExtended, 1, headerBytes.length);
         for (int i = 0; i < 6; i++) {
             for (int size = 6; size <= 9; size ++) {
                 headerBytesExtended[i] = (byte) (size & 0xFF);
-                int [] valData = validateIntactMasterTableHeader(headerBytesExtended, i, end + 1);
+                int [] valData = validateIntactMasterTableHeader(headerBytesExtended, i, end + 1, typeLength);
                 if (valData[0] >= 0) {
                     return new int[] { i + valData[0] - 1, valData[1] };
                 }

@@ -28,6 +28,14 @@ public class ByteSeqSearcher{
 	     *
 	     * @param pattern the pattern we will look for in future calls to search(...)
 	     */
+	    /**
+	     * @return the length of the pattern searched for
+	     */
+	    public int patternLength()
+	    {
+	        return pattern_.length;
+	    }
+
 	    public void setPattern(byte[] pattern)
 	    {
 	        pattern_ = Arrays.copyOf(pattern, pattern.length);

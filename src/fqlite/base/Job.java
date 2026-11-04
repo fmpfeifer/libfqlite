@@ -557,7 +557,7 @@ public class Job extends Base {
 				tpattern = new byte[] { 00, 116, 00, 97, 00, 98, 00, 108, 00, 101 };
 				/* we are looking for the word 'index' */
 				ipattern = new byte[] { 00, 105, 00, 110, 00, 100, 00, 101, 00, 120 };
-				goback = 15;
+				goback = 16;
 
 			}
 			
@@ -928,6 +928,9 @@ public class Job extends Base {
         }
 	}
 
+	/* number of bytes read before the text of the type column of a schema record */
+	private static final int SCHEMA_HEADER_BYTES = 9;
+
 	private void readDBSchema(LongPositionByteBuffer bb, int goback, ByteSeqSearcher btsearch, ByteSeqSearcher bisearch, int round, boolean isSinglePage) throws IOException {
 	    for (ByteSeqSearcher bsearch : new ByteSeqSearcher[] {btsearch, bisearch}) {
             
@@ -935,8 +938,12 @@ public class Job extends Base {
 
             /* search as long as we can find further table keywords */
             while (index != -1) {
-                /* get Header */
-                long headerpos = index - goback - 3;
+                /*
+                 * the record header ends where the text of the type column ('table'/'index') starts;
+                 * read the bytes before the text (payload length, rowid and header)
+                 */
+                long textstart = index - bsearch.patternLength();
+                long headerpos = textstart - SCHEMA_HEADER_BYTES;
                 if (headerpos < 0) {
                     /* not enough bytes before the keyword for a record header */
                     index = bsearch.indexOf(bb, index + 2);
@@ -953,20 +960,26 @@ public class Job extends Base {
 
                 int starthere = -1;
                 int headerSize = 0;
-                int [] valData = aux.validateIntactMasterTableHeader(mheader, goback + 3 - 5);
+                /* position of the bytes read relative to the page containing the text */
+                long page = textstart / ps;
+                int headerposInPage = (int) (headerpos - page * ps);
+                /* 'table' and 'index' have 5 characters */
+                int typeLength = (db_encoding == StandardCharsets.UTF_8) ? 5 : 10;
+                int [] valData = aux.validateIntactMasterTableHeader(mheader, 0, SCHEMA_HEADER_BYTES, typeLength);
                 int headerStart = valData[0];
                 if (headerStart != Integer.MIN_VALUE) {
                     headerSize = valData[1];
+                    /* start of the serial types (behind the header size byte) */
                     headerStart += 1;
-                    // compute offset
-                    starthere = (int)(index % ps) - goback + headerStart - 3;
+                    starthere = headerposInPage + headerStart;
                 } else {
-                    valData = aux.validateOverwrittenMasterTableHeader(mheader, goback + 3 - 5);
+                    /* the header size (and the bytes before) were overwritten - e.g. a deleted record */
+                    valData = aux.validateOverwrittenMasterTableHeader(mheader, SCHEMA_HEADER_BYTES, typeLength);
                     headerStart = valData[0];
                     if (headerStart != Integer.MIN_VALUE) {
                         headerSize = valData[1];
                         headerStart += 1;
-                        starthere = (int) (index % ps) - goback - headerStart - 3;
+                        starthere = headerposInPage + headerStart;
                     }
                 }
 
@@ -975,7 +988,7 @@ public class Job extends Base {
                     if (isSinglePage) {
                         bbb = bb.allocateAndReadBuffer(0, ps);
                     } else {
-                        bbb = readPageWithNumber(index / ps, ps);
+                        bbb = readPageWithNumber(page, ps);
                     }
                     if (bbb == null) {
                         break;
