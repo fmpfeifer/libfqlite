@@ -222,8 +222,15 @@ public class RecoveryTask extends Base implements Runnable {
 					
 				SqliteInternalRow row = null;
 				
-				if (celloff < buffer.limit() - 20) {
-				    row = ct.readRecord(celloff, buffer, pagenumber, visit, type, Integer.MAX_VALUE, firstcol,withoutROWID,-1);
+				/* small cells can be located in the very last bytes of the page */
+				if (celloff > 0 && celloff < buffer.limit()) {
+				    try {
+				        row = ct.readRecord(celloff, buffer, pagenumber, visit, type, Integer.MAX_VALUE, firstcol,withoutROWID,-1);
+				    } catch (RuntimeException e) {
+				        /* corrupted cell - skip it */
+				        debug("Could not read cell at offset ", celloff, " of page ", pagenumber, ": ", e);
+				        row = null;
+				    }
 				}
 								
 				// add new line to output
