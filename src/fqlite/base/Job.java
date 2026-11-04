@@ -13,11 +13,13 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Hashtable;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
@@ -189,6 +191,9 @@ public class Job extends Base {
 	AtomicInteger numberofcells = new AtomicInteger();
 	
 	Set<Integer> allreadyvisit;
+
+	/* pages on the freelist (trunk and leaf pages) - they do not belong to any b-tree */
+	private Set<Integer> freelistPages = ConcurrentHashMap.newKeySet();
 	
 	/* this array holds a description of the associated component for each data page, if known */
 	public AbstractDescriptor[] pages;
@@ -278,6 +283,7 @@ public class Job extends Base {
 	public int processDB() throws InterruptedException, ExecutionException, IOException {
 
 		allreadyvisit = ConcurrentHashMap.newKeySet();
+		freelistPages.clear();
 		List<TableDescriptor> recoveryTables = new LinkedList<>();
 
 		try {
@@ -741,11 +747,9 @@ public class Job extends Base {
 			buffer.position(32);
 			buffer.get(freelistpage);
 			info("FreeListPage starts at offset ", freelistpage);
-			ByteBuffer freelistoffset = ByteBuffer.wrap(freelistpage);
-			int head = freelistoffset.getInt();
+			int head = ByteBuffer.wrap(freelistpage).getInt();
 			info("head:: ", head);
 			fphead = head;
-			int start = (head - 1) * ps;
 
 			/*******************************************************************/
 
@@ -756,15 +760,17 @@ public class Job extends Base {
 			/*******************************************************************
 			 *
 			 * STEP 1: we start recovery process with scanning the free list first
+			 * 
+			 * A freelist trunk page has the following layout:
+			 *   0  4  page number of the next trunk page (0 for the last one)
+			 *   4  4  number of leaf page numbers on this trunk page (L)
+			 *   8  4L leaf page numbers
 			 **/
 
-			if (head > 0) {
-				info("first:: ", start, " 0hx ", Integer.toHexString(start));
+			if (head > 0 && head <= numberofpages) {
 
 				long startfp = System.currentTimeMillis();
 				info("Start free page recovery .....");
-
-				// seeking file pointer to the first free page entry
 
 				/* create a new threadpool to analyze the freepages */
 				ExecutorService executor = null;
@@ -772,76 +778,39 @@ public class Job extends Base {
 					executor = Executors.newFixedThreadPool(Global.numberofThreads);
 				}
 
-				/* a list can extend over several memory pages. */
-				boolean morelistpages = false;
-
 				int freepagesum = 0;
+				int trunk = head;
+				allreadyvisit.add(trunk);
+				int maxEntries = ps / 4 - 2;
 
-				do {
+				while (trunk > 0) {
+					freelistPages.add(trunk);
 					/* reserve space for the first/next page of the free list */
-					ByteBuffer fplist = file.allocateAndReadBuffer(start, ps);
+					ByteBuffer fplist = readPageWithNumber(trunk - 1, ps);
 					if (fplist == null) {
 					    break;
 					}
 
-					// next (possible) freepage list offset or 0xh00000000 + number of entries
-					// example : 00 00 15 3C | 00 00 02 2B
+					/* the next trunk page */
+					int nfp = fplist.getInt(0);
 
-					// now read the first 4 Byte to get the offset for the next free page list
-					byte nextlistoffset[] = new byte[4];
-
-					try {
-                        fplist.get(nextlistoffset);
-                    } catch(Exception err) {
-                        debug("Warning Error while parsing free list.");
-                    }
-
-					/*
-					 * is there a further page - <code>nextlistoffset</code> has a value > 0 in this
-					 * case
-					 */
-					if (!Auxiliary.bytesToHex(nextlistoffset).equals(NO_MORE_ENTRIES)) {
-						ByteBuffer of = ByteBuffer.wrap(nextlistoffset);
-						int nfp = of.getInt();
-						start = (nfp - 1) * ps;
-						if (!allreadyvisit.contains(nfp)) {
-							allreadyvisit.add(nfp);
-						    morelistpages = true;
-						} else {
-							info("Antiforensiscs found: cyclic freepage list entry");
-							morelistpages = false;
-						}
-					} else {
-						morelistpages = false;
+					/* now read the number of entries for this particular page */
+					int entries = fplist.getInt(4);
+					info(" Number of Entries in freepage list ", entries);
+					if (entries < 0 || entries > maxEntries) {
+						warning("Invalid number of entries in freelist trunk page ", trunk, ": ", entries);
+						entries = entries < 0 ? 0 : maxEntries;
 					}
 
-					// now read the number of entries for this particular page
-					byte numberOfEntries[] = new byte[4];
-					try {
-                        fplist.get(numberOfEntries);
-                    } catch(Exception err) {
-                    }
-					
-					ByteBuffer e = ByteBuffer.wrap(numberOfEntries);
-					int entries = e.getInt();
-					info(" Number of Entries in freepage list ", entries);
-
-					runningTasks.set(0);
-					
 					/* iterate through free page list and read free page offsets */
-					for (int zz = 1; zz <= entries; zz++) {
-						byte next[] = new byte[4];
-						fplist.position(4 * zz);
-						fplist.get(next);
+					for (int zz = 0; zz < entries; zz++) {
+						int n = fplist.getInt(8 + 4 * zz);
 
-						ByteBuffer bf = ByteBuffer.wrap(next);
-						int n = bf.getInt();
-
-						if (n == 0) {
+						if (n <= 0 || n > numberofpages || !freelistPages.add(n)) {
 							continue;
 						}
 						// determine offset for free page
-						int offset = (n - 1) * ps;
+						long offset = (long) (n - 1) * ps;
 
 						RecoveryTask task = new RecoveryTask(aux, this, offset, n, ps, true, recoveryTables);
 						/* add new task to executor queue */
@@ -849,12 +818,22 @@ public class Job extends Base {
 						if (executor != null) {
 							executor.execute(task);
 						} else {
-							task.runSingleThread();
+							/* errors are logged - a corrupted page must not stop the recovery */
+							task.run();
 						}
 					}
 					freepagesum += entries;
 
-				} while (morelistpages); // while
+					/* is there a further trunk page? */
+					if (nfp <= 0 || nfp > numberofpages) {
+						trunk = 0;
+					} else if (!allreadyvisit.add(nfp)) {
+						info("Antiforensiscs found: cyclic freepage list entry");
+						trunk = 0;
+					} else {
+						trunk = nfp;
+					}
+				}
 
 				info("Task total: ", runningTasks.intValue());
 
@@ -1041,7 +1020,7 @@ public class Job extends Base {
 		
 		for (int cc = 1; cc < pages.length; cc++) {
 			
-			if (null == pages[cc]) 
+			if (null == pages[cc] || freelistPages.contains(cc)) 
 			{
 				debug("page ", cc, " is no regular leaf page component. Maybe a indices or overflow or dropped component page.");
 				//System.out.println("page " + cc + " offset " + ((cc-1)*ps) + " is no regular leaf page component. Maybe a indices or overflow or dropped component page.");
@@ -1051,7 +1030,7 @@ public class Job extends Base {
 				debug("page ", cc, " is a regular leaf page. ");
 
 				// determine offset for free page
-				long offset = (cc - 1) * ps;
+				long offset = (long) (cc - 1) * ps;
 
 				//System.out.println("************************ pagenumber " + cc + " " + offset);
 
@@ -1073,7 +1052,8 @@ public class Job extends Base {
 				/* add new task to executor queue */
 				executor.execute(t);
 			} else {
-            	t.runSingleThread();
+				/* errors are logged - a corrupted page must not stop the recovery */
+				t.run();
 			}
 		}
 
@@ -1208,7 +1188,7 @@ public class Job extends Base {
 		{
 		   return null;
 		}
-		return readPageWithOffset(pagenumber*pagesize, pagesize);
+		return readPageWithOffset(pagenumber * (long) pagesize, pagesize);
 	}	
 	
 	/**
@@ -1217,100 +1197,63 @@ public class Job extends Base {
      * for primary and secondary indexes on database relations. 
      * 
      * This method can be called to traverse all nodes of 
-     * a table-tree. 
+     * a table-tree or an index-tree. Every page is visited at most once,
+     * so corrupted trees with cycles can not lead to an endless loop.
      * 
-     * Attention! This is a recursive function. 
-     * 
-     * 
-     * @param pageNumber  the page number
+     * @param rootPage  the page number of the root page
      * @param visitor   visitor to act on leaf pages 
      * @throws IOException ioException
      */
-    private void exploreBTree(int pageNumber, BTreePageVisitor visitor) throws IOException {
-        
-        // pagesize * (rootindex - 1) -> go to the start of this page
-        int fileOffset = ps * (pageNumber - 1);
+    private void exploreBTree(int rootPage, BTreePageVisitor visitor) throws IOException {
 
-        if(fileOffset < 0 || pageNumber < 0)
-            return;
-        
-        if (fileOffset >= file.size()) {
-            return;
-        }
-        
-        int pageHeaderOffset = 0;
-        if (pageNumber == 1) {
-            pageHeaderOffset = 100;
-        }
+        Deque<Integer> stack = new ArrayDeque<>();
+        Set<Integer> visited = new HashSet<>();
+        stack.push(rootPage);
 
-        // first byte of page
-        file.position(fileOffset + pageHeaderOffset);
-        byte pageType = file.get();
+        while (!stack.isEmpty()) {
+            int pageNumber = stack.pop();
 
-        /* check type of the page by reading the first byte */
-        int typ = Auxiliary.getPageType(pageType);
+            if (pageNumber <= 0 || pageNumber > numberofpages || !visited.add(pageNumber))
+                continue;
 
-        /* not supported yet */
-        if (typ == 2) {
-            debug(" page number", pageNumber, " is a  INDEXINTERIORPAGE.");
-        } else if (typ == 12) {
-            /* type is either a data interior page (12) */
-            debug("page number ", pageNumber, " is a interior data page ");
-
-            /* now we have to read the cell pointer list with offsets for the other pages */
-
-            /* read the complete internal page into buffer */
-            //System.out.println(" read internal page at offset " + ((root-1)*ps));
             ByteBuffer buffer = readPageWithNumber(pageNumber - 1, ps);
-            if (buffer == null) {
-                return;
+            if (buffer == null)
+                continue;
+
+            int pageHeaderOffset = (pageNumber == 1) ? 100 : 0;
+
+            /* check type of the page by reading the first byte */
+            int typ = Auxiliary.getPageType(buffer.get(pageHeaderOffset));
+
+            if (typ == 12 || typ == 2) {
+                /* interior page of a table (12) or of an index (2) */
+                debug("page number ", pageNumber, " is an interior page ");
+
+                int e = buffer.getShort(pageHeaderOffset + 3) & 0xFFFF;
+                List<Integer> children = new ArrayList<>();
+
+                /* go on with the cell pointer array */
+                for (int i = 0; i < e; i++) {
+                    int pointer = pageHeaderOffset + 12 + 2 * i;
+                    if (pointer + 2 > buffer.limit())
+                        break;
+                    int celloff = buffer.getShort(pointer) & 0xFFFF;
+                    /* each cell starts with the page number of the left child */
+                    if (celloff + 4 > buffer.limit())
+                        continue;
+                    children.add(buffer.getInt(celloff));
+                }
+                /* the right most child pointer is part of the page header */
+                children.add(buffer.getInt(pageHeaderOffset + 8));
+
+                /* visit the children in their order */
+                for (int i = children.size() - 1; i >= 0; i--)
+                    stack.push(children.get(i));
             }
-
-            byte[] numberofcells = new byte[2];
-            buffer.position(pageHeaderOffset + 3);
-
-            buffer.get(numberofcells);
-            int e = Auxiliary.TwoByteBuffertoInt(numberofcells);              
-
-            /* go on with the cell pointer array */
-            for (int i = 0; i < e; i++) {
-
-                // address of the next cell pointer
-                byte [] celladdr = new byte[2];
-                buffer.position(pageHeaderOffset + 12 + 2 * i);
-                if (buffer.capacity() <= buffer.position()+2)
-                    continue;
-                buffer.get(celladdr);
-                int celloff = Auxiliary.TwoByteBuffertoInt(celladdr);
-
-                // read page number of next node in the btree
-                byte pnext[] = new byte[4];
-                if (celloff >= buffer.capacity() || celloff < 0)
-                    continue;
-                if (celloff > ps)
-                    continue;
-                buffer.position(celloff);
-                buffer.get(pnext);
-                int p = ByteBuffer.wrap(pnext).getInt();
-                // unfolding the next level of the tree
-                debug(" child page ", p);
-                exploreBTree(p, visitor);
+            else if (typ == 8 || typ == 10) {
+                debug("page number ", pageNumber, " is a leaf page set component/index to sqlite schema ");
+                visitor.visitLeafPage(pageNumber);
             }
-            
-            ByteBuffer rightChildptr = file.allocateAndReadBuffer(fileOffset + pageHeaderOffset + 8, 4);
-            
-            if (rightChildptr != null) {
-                /* recursive */
-                exploreBTree(rightChildptr.getInt(), visitor);
-            }
-
-        } 
-        else if (typ == 8 || typ == 10) {
-            debug("page number ", pageNumber, " is a leaf page set component/index to sqlite schema ");
-            if (pageNumber >  numberofpages)
-                return;
-            
-            visitor.visitLeafPage(pageNumber);
         }
     }
 

@@ -182,6 +182,11 @@ public class RecoveryTask extends Base implements Runnable {
 
 			ByteBuffer size = ByteBuffer.wrap(cpn);
 			int cp = Auxiliary.TwoByteBuffertoInt(size);
+			/* the cell pointer array can not be larger than the page (corrupted page) */
+			cp = Math.min(cp, (pagesize - 8) / 2);
+			/* a value of zero means 65536 */
+			if (ccrstart == 0)
+				ccrstart = 65536;
 
 			debug(" number of cells: ", cp, " type of page ",  type);
 			job.numberofcells.addAndGet(cp);
@@ -277,7 +282,8 @@ public class RecoveryTask extends Base implements Runnable {
 			int garbageoffset = -1;
 			do
 			{
-				
+				if (buffer.remaining() < 2)
+					break;
 				buffer.get(garbage);
 				ByteBuffer ignore = ByteBuffer.wrap(garbage);
 				garbageoffset = Auxiliary.TwoByteBuffertoInt(ignore);
@@ -311,7 +317,12 @@ public class RecoveryTask extends Base implements Runnable {
 				
 				/* Tricky thing : data record could be partly overwritten with a new data record!!!  */
 				/* We should read until the end of the unallocated area and not above! */
-				row = ct.readRecord(buffer.position(), buffer, pagenumber, visit, type, ccrstart - buffer.position(),firstcol,withoutROWID,-1);
+				try {
+					row = ct.readRecord(buffer.position(), buffer, pagenumber, visit, type, ccrstart - buffer.position(),firstcol,withoutROWID,-1);
+				} catch (RuntimeException e) {
+					debug("Could not read record in unallocated space of page ", pagenumber, ": ", e);
+					row = null;
+				}
 				
 				// add new line to output
 				if (null != row) { // && rc.length() > 0) {
