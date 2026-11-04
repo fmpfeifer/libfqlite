@@ -12,6 +12,8 @@ public class SqliteInternalRow {
     private String tableName = "";
     private String recordType = "";
     private String lineSuffix = "";
+    private RecordSource source = RecordSource.DATABASE;
+    private long rowid = Long.MIN_VALUE;
     private Map<String, Integer> colIdx = null;
 
     void setColumnNamesMap(Map<String, Integer> colIdx) {
@@ -70,6 +72,29 @@ public class SqliteInternalRow {
         return lineSuffix;
     }
     
+    /**
+     * @return the file this record was read from
+     */
+    /**
+     * @return the rowid read from the cell, Long.MIN_VALUE if unknown (WITHOUT ROWID tables,
+     *         indices and carved records)
+     */
+    public long getRowId() {
+        return rowid;
+    }
+
+    public void setRowId(long rowid) {
+        this.rowid = rowid;
+    }
+
+    public RecordSource getSource() {
+        return source;
+    }
+
+    public void setSource(RecordSource source) {
+        this.source = source;
+    }
+
     public void setLineSuffix(String lineSuffix) {
         this.lineSuffix = lineSuffix;
     }
@@ -153,14 +178,28 @@ public class SqliteInternalRow {
         result.setTableName(tableName);
         result.setDeletedRow(isDeletedRow());
         result.setColumnNamesMap(colIdx);
+        result.setSource(source);
+        result.setOffset(offset);
         Object [] data = new Object[rowData.size()];
+        Object [] raw = null;
         for (int i = 0; i < data.length; i++) {
             SqliteElementData d = rowData.get(i);
             if (d != null) {
                 data[i] = d.getObject();
+                if (data[i] instanceof String && Global.CONVERT_DATETIME) {
+                    /* keep the numeric value of values converted to a date string */
+                    Object value = d.getObject(false);
+                    if (value instanceof Number) {
+                        if (raw == null) {
+                            raw = new Object[data.length];
+                        }
+                        raw[i] = value;
+                    }
+                }
             }
         }
         result.setRowData(data);
+        result.setRawData(raw);
         
         return result;
     }

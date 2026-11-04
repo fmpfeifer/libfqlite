@@ -13,13 +13,16 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Hashtable;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -189,6 +192,12 @@ public class Job extends Base {
 	AtomicInteger numberofcells = new AtomicInteger();
 	
 	Set<Integer> allreadyvisit;
+
+	/* pages on the freelist (trunk and leaf pages) - they do not belong to any b-tree */
+	private Set<Integer> freelistPages = ConcurrentHashMap.newKeySet();
+
+	/* pages of all known b-trees (tables, indices and the schema) */
+	private Set<Integer> btreePages = ConcurrentHashMap.newKeySet();
 	
 	/* this array holds a description of the associated component for each data page, if known */
 	public AbstractDescriptor[] pages;
@@ -215,6 +224,13 @@ public class Job extends Base {
 
 	public boolean recoverOnlyDeletedRecords = false;
 
+	/**
+	 * B-tree balancing leaves copies of current records in the free space of pages. By
+	 * default such copies (same table and values as a current record) are not reported as
+	 * deleted records. Set to true to report them.
+	 */
+	public boolean keepCopiesOfLiveRecords = false;
+
 	public SQLiteSchemaParser schemaParser = new SQLiteSchemaParser();
 	
 	private Object lock = new Object();
@@ -222,24 +238,37 @@ public class Job extends Base {
 	  
 	/******************************************************************************************************/
 	
-	private RandomAccessFileReader readWAL(String walpath) throws IOException {
-		
-		Path p = Paths.get(walpath);
-		if (! Files.exists(p)) {
-		    return null;
+	/**
+	 * Search for schema entries (sqlite_master records) in every page stored in the WAL archive.
+	 */
+	private void readDBSchemaFromWAL(int goBack, ByteSeqSearcher btsearch, ByteSeqSearcher bisearch) throws IOException {
+		String wp = walpath != null ? walpath : path + "-wal";
+		Path p = Paths.get(wp);
+		if (!Files.exists(p)) {
+		    return;
 		}
 
-		/* First - try to analyze the db-schema */
-		/*
-		 * we have to do this before we open the database because of the concurrent
-		 * access in multi threading mode
-		 */
-
-		/* try to open the wal-file in read-only mode */
-		RandomAccessFileReader file = new RandomAccessFileReader(p);
-		resourcesToClose.addFirst(file);
-		return file;
-		
+		try (RandomAccessFileReader walfile = new RandomAccessFileReader(p)) {
+		    ByteBuffer walheader = walfile.allocateAndReadBuffer(0, 32);
+		    if (walheader == null) {
+		        return;
+		    }
+		    int walps = walheader.getInt(8);
+		    if (walps == 1)
+		        walps = 65536;
+		    if (walps != ps) {
+		        warning("Page size of WAL file (", walps, ") differs from database page size (", ps, ")");
+		        return;
+		    }
+		    /* each frame: 24 bytes frame header + page */
+		    for (long frame = 32; frame + 24 + ps <= walfile.size(); frame += 24 + ps) {
+		        ByteBuffer page = walfile.allocateAndReadBuffer(frame + 24, ps);
+		        if (page == null) {
+		            break;
+		        }
+		        readDBSchema(new LongPositionByteBufferWrapper(page), goBack, btsearch, bisearch, true);
+		    }
+		}
 	}
 	
 	protected void tableDescriptorReady(TableDescriptor td) {
@@ -265,6 +294,8 @@ public class Job extends Base {
 	public int processDB() throws InterruptedException, ExecutionException, IOException {
 
 		allreadyvisit = ConcurrentHashMap.newKeySet();
+		freelistPages.clear();
+		btreePages.clear();
 		List<TableDescriptor> recoveryTables = new LinkedList<>();
 
 		try {
@@ -364,15 +395,13 @@ public class Job extends Base {
 			info("Maximum embedded payload fraction. Must be 64.", maxpayloadfrac);
 
 			minpayloadfrac = buffer.get();
-			info("Minimum embedded payload fraction. Must be 32.", maxpayloadfrac);
+			info("Minimum embedded payload fraction. Must be 32.", minpayloadfrac);
 
 			leafpayloadfrac = buffer.get();
 			info("Leaf payload fraction. Must be 32.  ", leafpayloadfrac);
 
-			buffer.position(16);
-			inheaderdbsize = Integer.toUnsignedLong(buffer.getInt());
-			if (inheaderdbsize == 1)
-				inheaderdbsize = 65536;
+			/* offset 28: size of the database file in pages (the "in-header database size") */
+			inheaderdbsize = Integer.toUnsignedLong(buffer.getInt(28));
 			
 			buffer.position(24);
 			filechangecounter = Integer.toUnsignedLong(buffer.getInt());
@@ -419,11 +448,12 @@ public class Job extends Base {
 			
 			buffer.position(52);
 			avacc = Integer.toUnsignedLong(buffer.getInt());
+			/* largest root b-tree page: non-zero in auto-vacuum or incremental-vacuum mode */
 			if (avacc == 0) {
 				info("Seems to be no AutoVacuum db. Nice :-).");
-				autovacuum = true;
-			} else
 				autovacuum = false;
+			} else
+				autovacuum = true;
 
 			/********************************************************************/
 			// Determine database text encoding.
@@ -538,7 +568,7 @@ public class Job extends Base {
 				tpattern = new byte[] { 00, 116, 00, 97, 00, 98, 00, 108, 00, 101 };
 				/* we are looking for the word 'index' */
 				ipattern = new byte[] { 00, 105, 00, 110, 00, 100, 00, 101, 00, 120 };
-				goback = 15;
+				goback = 16;
 
 			}
 			
@@ -554,54 +584,31 @@ public class Job extends Base {
             /* to mark the start of an indices entry for the sqlmaster_table */
             final ByteSeqSearcher bisearch = new ByteSeqSearcher(ipattern);
 			
-			boolean again = false;
-			int round = 0;
-			RandomAccessFileReader bb = file;
-			
 			// try to read DB schema following btree.
-			exploreBTree(1, 
+			exploreBTree(1,
 			        pageNumber -> {
-			            readDBSchema(new LongPositionByteBufferWrapper(readPageWithNumber(pageNumber-1, ps)),
-			                goBack, btsearch, bisearch, 1, true);
+			            ByteBuffer page = readPageWithNumber(pageNumber - 1, ps);
+			            if (page != null) {
+			                readDBSchema(new LongPositionByteBufferWrapper(page),
+			                    goBack, btsearch, bisearch, true);
+			            }
 			        }
 			);
-			
-			/**
-			 * Step into loop
-			 * 
-			 * 1. iteration:  Try to read table and index information from normal database
-			 * 
-			 * 2. iteration:  No information found but a WAL archive in place - try to get the
-			 *                missing information in a second look from the WAL archive
-			 * 
+
+			/*
+			 * 1. Try to read table and index information from the whole database file
+			 *    (this finds deleted schema entries too)
+			 *
+			 * 2. No information found but a WAL archive in place - try to get the
+			 *    missing information from the pages stored in the WAL archive
 			 */
-			do
-			{
-				round++;
-				
-				if (round == 2 && !readWAL)
-					break;
-				
-				readDBSchema(bb, goback, btsearch, bisearch, round, false);
-							
-				/* Is there a table schema definition inside the main database file ???? */
-				info("headers:::: ", headers.size());
-				
-				if(headers.size()==0 && this.readWAL ==true)
-				{
-					// second try - maybe we could find a schema definition inside of the WAL-archive file instead?!
-					
-				    info("Could not find a schema definition inside the main db-file. Try to find something inside the WAL archive");
-				
-				    bb = readWAL(this.path+"-wal");
-				    
-				    if (null != bb)
-				    	again = true;
-					
-				}
-			
+			readDBSchema(file, goback, btsearch, bisearch, false);
+			info("headers:::: ", headers.size());
+
+			if (headers.size() == 0 && readWAL) {
+			    info("Could not find a schema definition inside the main db-file. Try to find something inside the WAL archive");
+			    readDBSchemaFromWAL(goBack, btsearch, bisearch);
 			}
-			while(again && round < 2 && readWAL && !readRollbackJournal);
 
 			/*******************************************************************/
 
@@ -623,36 +630,37 @@ public class Job extends Base {
 						List<String> idname = id.columnnames;
 						List<String> tdnames = td.columnnames;
 
+						/* we need to find the missing column types - one type per index column */
 						for (int z = 0; z < idname.size(); z++) {
-
-							if (tdnames.contains(idname.get(z))) {
-								/* we need to find the missing column types */
-								try
-								{
-									int match = tdnames.indexOf(idname.get(z));
-									String type = td.getColumntypes().get(match);
-									id.columntypes.add(type);
-									info("ADDING IDX TYPE::: ", type, " FOR TABLE ", td.tblname, " INDEx ",
-											id.idxname);
-								}
-								catch(Exception err)
-								{
-									
-									id.columntypes.add("");
-								}
-								
-
+							int match = tdnames.indexOf(idname.get(z));
+							String type = null;
+							if (match >= 0 && match < td.getColumntypes().size()) {
+								type = td.getColumntypes().get(match);
 							}
-
+							/* expression or unknown column: NUMERIC matches any value */
+							id.columntypes.add(type == null || type.isEmpty() ? "NUMERIC" : type);
+							debug("ADDING IDX TYPE::: ", type, " FOR TABLE ", td.tblname, " INDEx ", id.idxname);
 						}
-						/**
-						 * The index contains data from the columns that you specify in the index and
-						 * the corresponding rowid value. This helps SQLite quickly locate the row based
-						 * on the values of the indexed columns.
-						 */
 
-						id.columnnames.add("rowid");
-						id.columntypes.add("INT");
+						if (td.ROWID) {
+							/**
+							 * The index contains data from the columns that you specify in the index and
+							 * the corresponding rowid value. This helps SQLite quickly locate the row based
+							 * on the values of the indexed columns.
+							 */
+							id.columnnames.add("rowid");
+							id.columntypes.add("INT");
+						} else {
+							/* WITHOUT ROWID table: the index holds the primary key columns instead of the rowid */
+							for (String pk : td.primarykeycolumns) {
+								if (!id.columnnames.contains(pk)) {
+									int match = tdnames.indexOf(pk);
+									String type = (match >= 0 && match < td.getColumntypes().size()) ? td.getColumntypes().get(match) : null;
+									id.columnnames.add(pk);
+									id.columntypes.add(type == null || type.isEmpty() ? "NUMERIC" : type);
+								}
+							}
+						}
 
 						/* HeadPattern !!! */
 						Auxiliary.addHeadPattern2Idx(id);
@@ -700,12 +708,17 @@ public class Job extends Base {
 				exploreBTree(td.getRootOffset(), pageNumber -> { 
                         if (null == pages[pageNumber])
                             pages[pageNumber] = td;
-                    }
+                    }, !td.ROWID
                 );
 
 			}
 
 			/*******************************************************************/
+
+			/* mark all pages of the index b-trees (the descriptors are only assigned to the leaf root) */
+			for (IndexDescriptor id : indices.values()) {
+				exploreBTree(id.getRootOffset(), pageNumber -> { }, true);
+			}
 
 			for (IndexDescriptor id : indices.values()) {
 				int r = id.getRootOffset();
@@ -735,6 +748,13 @@ public class Job extends Base {
 			headers.put(tdefault.getName(), tdefault);
 			
 			unassignedTableCreated(tdefault);
+
+			/*
+			 * The records are collected first: the current version of each page is only known
+			 * after reading the WAL and journal files, and deleted records which are copies of
+			 * current records are only known when all records were read
+			 */
+			collectedRows = new ConcurrentLinkedQueue<>();
 			/*******************************************************************/
 
 			byte freepageno[] = new byte[4];
@@ -751,11 +771,9 @@ public class Job extends Base {
 			buffer.position(32);
 			buffer.get(freelistpage);
 			info("FreeListPage starts at offset ", freelistpage);
-			ByteBuffer freelistoffset = ByteBuffer.wrap(freelistpage);
-			int head = freelistoffset.getInt();
+			int head = ByteBuffer.wrap(freelistpage).getInt();
 			info("head:: ", head);
 			fphead = head;
-			int start = (head - 1) * ps;
 
 			/*******************************************************************/
 
@@ -766,92 +784,57 @@ public class Job extends Base {
 			/*******************************************************************
 			 *
 			 * STEP 1: we start recovery process with scanning the free list first
+			 * 
+			 * A freelist trunk page has the following layout:
+			 *   0  4  page number of the next trunk page (0 for the last one)
+			 *   4  4  number of leaf page numbers on this trunk page (L)
+			 *   8  4L leaf page numbers
 			 **/
 
-			if (head > 0) {
-				info("first:: ", start, " 0hx ", Integer.toHexString(start));
+			if (head > 0 && head <= numberofpages) {
 
 				long startfp = System.currentTimeMillis();
 				info("Start free page recovery .....");
 
-				// seeking file pointer to the first free page entry
-
 				/* create a new threadpool to analyze the freepages */
 				ExecutorService executor = null;
-				if (Global.numberofThreads > 0) {
-					executor = Executors.newFixedThreadPool(Global.numberofThreads);
+				if (getNumberOfThreads() > 0) {
+					executor = Executors.newFixedThreadPool(getNumberOfThreads());
 				}
 
-				/* a list can extend over several memory pages. */
-				boolean morelistpages = false;
-
 				int freepagesum = 0;
+				int trunk = head;
+				allreadyvisit.add(trunk);
+				int maxEntries = ps / 4 - 2;
 
-				do {
+				while (trunk > 0) {
+					freelistPages.add(trunk);
 					/* reserve space for the first/next page of the free list */
-					ByteBuffer fplist = file.allocateAndReadBuffer(start, ps);
+					ByteBuffer fplist = readPageWithNumber(trunk - 1, ps);
 					if (fplist == null) {
 					    break;
 					}
 
-					// next (possible) freepage list offset or 0xh00000000 + number of entries
-					// example : 00 00 15 3C | 00 00 02 2B
+					/* the next trunk page */
+					int nfp = fplist.getInt(0);
 
-					// now read the first 4 Byte to get the offset for the next free page list
-					byte nextlistoffset[] = new byte[4];
-
-					try {
-                        fplist.get(nextlistoffset);
-                    } catch(Exception err) {
-                        debug("Warning Error while parsing free list.");
-                    }
-
-					/*
-					 * is there a further page - <code>nextlistoffset</code> has a value > 0 in this
-					 * case
-					 */
-					if (!Auxiliary.bytesToHex(nextlistoffset).equals(NO_MORE_ENTRIES)) {
-						ByteBuffer of = ByteBuffer.wrap(nextlistoffset);
-						int nfp = of.getInt();
-						start = (nfp - 1) * ps;
-						if (!allreadyvisit.contains(nfp)) {
-							allreadyvisit.add(nfp);
-						    morelistpages = true;
-						} else {
-							info("Antiforensiscs found: cyclic freepage list entry");
-							morelistpages = false;
-						}
-					} else {
-						morelistpages = false;
+					/* now read the number of entries for this particular page */
+					int entries = fplist.getInt(4);
+					info(" Number of Entries in freepage list ", entries);
+					if (entries < 0 || entries > maxEntries) {
+						warning("Invalid number of entries in freelist trunk page ", trunk, ": ", entries);
+						entries = entries < 0 ? 0 : maxEntries;
 					}
 
-					// now read the number of entries for this particular page
-					byte numberOfEntries[] = new byte[4];
-					try {
-                        fplist.get(numberOfEntries);
-                    } catch(Exception err) {
-                    }
-					
-					ByteBuffer e = ByteBuffer.wrap(numberOfEntries);
-					int entries = e.getInt();
-					info(" Number of Entries in freepage list ", entries);
-
-					runningTasks.set(0);
-					
 					/* iterate through free page list and read free page offsets */
-					for (int zz = 1; zz <= entries; zz++) {
-						byte next[] = new byte[4];
-						fplist.position(4 * zz);
-						fplist.get(next);
+					for (int zz = 0; zz < entries; zz++) {
+						int n = fplist.getInt(8 + 4 * zz);
 
-						ByteBuffer bf = ByteBuffer.wrap(next);
-						int n = bf.getInt();
-
-						if (n == 0) {
+						if (n <= 0 || n > numberofpages || !freelistPages.add(n)) {
 							continue;
 						}
 						// determine offset for free page
-						int offset = (n - 1) * ps;
+						long offset = (long) (n - 1) * ps;
 
 						RecoveryTask task = new RecoveryTask(aux, this, offset, n, ps, true, recoveryTables);
 						/* add new task to executor queue */
@@ -859,12 +842,32 @@ public class Job extends Base {
 						if (executor != null) {
 							executor.execute(task);
 						} else {
-							task.runSingleThread();
+							/* errors are logged - a corrupted page must not stop the recovery */
+							task.run();
 						}
 					}
 					freepagesum += entries;
 
-				} while (morelistpages); // while
+					/* the rest of the trunk page still holds its former content */
+					RecoveryTask trunkTask = new RecoveryTask(aux, this, (long) (trunk - 1) * ps, trunk, ps, true, recoveryTables);
+					trunkTask.setFreelistTrunk(entries);
+					runningTasks.incrementAndGet();
+					if (executor != null) {
+						executor.execute(trunkTask);
+					} else {
+						trunkTask.run();
+					}
+
+					/* is there a further trunk page? */
+					if (nfp <= 0 || nfp > numberofpages) {
+						trunk = 0;
+					} else if (!allreadyvisit.add(nfp)) {
+						info("Antiforensiscs found: cyclic freepage list entry");
+						trunk = 0;
+					} else {
+						trunk = nfp;
+					}
+				}
 
 				info("Task total: ", runningTasks.intValue());
 
@@ -890,10 +893,29 @@ public class Job extends Base {
 			// full db-scan (including all database pages)
 			scan(numberofpages, ps, recoveryTables);
 
+			/* deleted records which only survived as index entries */
+			indexRecovery = new IndexEntryRecovery(this, aux);
+			if (!indexRecovery.isEmpty()) {
+				Map<IndexDescriptor, java.util.Collection<Integer>> leaves = new HashMap<>();
+				for (IndexDescriptor id : indices.values()) {
+					List<Integer> l = new ArrayList<>();
+					exploreBTree(id.getRootOffset(), l::add, true);
+					leaves.put(id, l);
+				}
+				try {
+					indexRecovery.recoverFromIndexPages(leaves);
+					indexRecovery.recoverFromFreelist(new ArrayList<>(freelistPages));
+				} catch (RuntimeException e) {
+					err("Error while recovering index entries: ", e);
+				}
+			}
+
 			/*******************************************************************/
 			
 			if (readRollbackJournal) {
-	            /* the readWAL option is enabled -> check the WAL-file too */
+	            /* the readRollbackJournal option is enabled -> check the journal file too */
+	            if (rollbackjournalpath == null)
+	                rollbackjournalpath = path + "-journal";
 	            Logger.out.info(" RollbackJournal-File ", this.rollbackjournalpath);
 	            rol = new RollbackJournalReaderBase(rollbackjournalpath, this) {
                     @Override
@@ -901,21 +923,27 @@ public class Job extends Base {
                     }
 	            };
 	            rol.ps = this.ps;
+	            rol.tables.addAll(recoveryTables);
 	            /* start parsing Rollbackjournal-file */
 	            rol.parse();
 	        }
 	        if (readWAL) {
 	            /* the readWAL option is enabled -> check the WAL-file too */
+	            if (walpath == null)
+	                walpath = path + "-wal";
 	            Logger.out.info(" WAL-File ", walpath);
 	            wal = new WALReaderBase(walpath, this) {
                     @Override
                     public void output() {                        
                     }
                 };
+	            wal.tables.addAll(recoveryTables);
 	            /* start parsing WAL-file */
 	            wal.parse();
 	        }
 			
+			resolvePageVersions();
+
 			linesReady();
 
 		} finally {
@@ -951,17 +979,31 @@ public class Job extends Base {
                 err(e);
             }
         }
+	    resourcesToClose.clear();
 	}
 
-	private void readDBSchema(LongPositionByteBuffer bb, int goback, ByteSeqSearcher btsearch, ByteSeqSearcher bisearch, int round, boolean isSinglePage) throws IOException {
+	/* number of bytes read before the text of the type column of a schema record */
+	private static final int SCHEMA_HEADER_BYTES = 9;
+
+	private void readDBSchema(LongPositionByteBuffer bb, int goback, ByteSeqSearcher btsearch, ByteSeqSearcher bisearch, boolean isSinglePage) throws IOException {
 	    for (ByteSeqSearcher bsearch : new ByteSeqSearcher[] {btsearch, bisearch}) {
             
             long index = bsearch.indexOf(bb, 0);
 
             /* search as long as we can find further table keywords */
             while (index != -1) {
-                /* get Header */
-                bb.position(index - goback - 3);
+                /*
+                 * the record header ends where the text of the type column ('table'/'index') starts;
+                 * read the bytes before the text (payload length, rowid and header)
+                 */
+                long textstart = index - bsearch.patternLength();
+                long headerpos = textstart - SCHEMA_HEADER_BYTES;
+                if (headerpos < 0) {
+                    /* not enough bytes before the keyword for a record header */
+                    index = bsearch.indexOf(bb, index + 2);
+                    continue;
+                }
+                bb.position(headerpos);
                 int hsize = Math.min(40, (int) (bb.size() - bb.position()));
                 if (hsize < 20) {
                     break;
@@ -970,80 +1012,46 @@ public class Job extends Base {
 
                 bb.get(mheader);
 
-                int [] valData = aux.validateIntactMasterTableHeader(mheader, goback + 3 - 5);
+                int starthere = -1;
+                int headerSize = 0;
+                /* position of the bytes read relative to the page containing the text */
+                long page = textstart / ps;
+                int headerposInPage = (int) (headerpos - page * ps);
+                /* 'table' and 'index' have 5 characters */
+                int typeLength = (db_encoding == StandardCharsets.UTF_8) ? 5 : 10;
+                int [] valData = aux.validateIntactMasterTableHeader(mheader, 0, SCHEMA_HEADER_BYTES, typeLength);
                 int headerStart = valData[0];
-                int headerSize = valData[1];
                 if (headerStart != Integer.MIN_VALUE) {
-                    headerStart += 1;
-                    // compute offset
-                    int starthere = (int)(index % ps) - goback + headerStart - 3;
-
-                    if (starthere >= 0) {
-                        ByteBuffer bbb = null;
-                        if (round == 1) {
-                            if (isSinglePage) {
-                                bbb = bb.allocateAndReadBuffer(0, ps);
-                            } else {
-                                int pagenumber = (int)(index / ps);
-                                bbb = readPageWithNumber(pagenumber, ps);
-                            }
-                        } else {
-                            starthere = (int) ((index - 32) % (ps + 24)) - goback + headerStart - 3;
-                            bbb = bb.allocateAndReadBuffer(32 + 24 + index/ps, ps);
-                        }
-                        if (bbb == null) {
-                            break;
-                        }
-                        aux.readMasterTableRecord(starthere, bbb, headerSize);
-                    }
-                } else {
-                    valData = aux.validateOverwrittenMasterTableHeader(mheader, goback + 3 - 5);
-                    headerStart = valData[0];
                     headerSize = valData[1];
-                    if (headerStart != Integer.MIN_VALUE) {                         
+                    /* start of the serial types (behind the header size byte) */
+                    headerStart += 1;
+                    starthere = headerposInPage + headerStart;
+                } else {
+                    /* the header size (and the bytes before) were overwritten - e.g. a deleted record */
+                    valData = aux.validateOverwrittenMasterTableHeader(mheader, SCHEMA_HEADER_BYTES, typeLength);
+                    headerStart = valData[0];
+                    if (headerStart != Integer.MIN_VALUE) {
+                        headerSize = valData[1];
                         headerStart += 1;
-                        int starthere = (int) (index % ps) - goback - headerStart - 3;
-                        
-                        if (starthere >= 0) {
-                            ByteBuffer bbb = null;
-                            /* first try to read the db schema from the main db file */
-                            if (round == 1)
-                            {
-                                if (isSinglePage) {
-                                    bbb = bb.allocateAndReadBuffer(0, ps);
-                                } else {
-                                    int pagenumber = (int) (index / ps);
-                                    bbb = readPageWithNumber(pagenumber, ps);
-                                }
-                            }
-                            /* No schema was found? Try reading the WAL file instead */
-                            else
-                            {
-                                long pagebegin = 0;
-                                // first page ?
-                                if (index < (ps + 56))
-                                {
-                                    // skip WAL header (32 Bytes) and frame header (24 Bytes)
-                                    pagebegin = 56;
-                                    starthere  = (int) (index - 56)  - goback - headerStart - 3;
-                                }
-                                else
-                                {
-                                    pagebegin = ((index - 32) / (ps + 24)) * (ps + 24) - 24 + 32;      //32 + (ps+24)*index/(ps+24) + 24;
-                                    starthere = (int) ((index - 32) % (ps + 24) + 24)  - goback - headerStart - 3;
-                                }
-                                
-                                /* go to frame start */
-                                bbb = file.allocateAndReadBuffer(pagebegin, ps);
-                                
-                            }
-                            if (bbb == null) {
-                                break;
-                            }
-                            
-                            /* start reading the schema string from the correct position */
-                            aux.readMasterTableRecord(starthere, bbb, headerSize);
-                        }
+                        starthere = headerposInPage + headerStart;
+                    }
+                }
+
+                if (starthere >= 0) {
+                    ByteBuffer bbb;
+                    if (isSinglePage) {
+                        bbb = bb.allocateAndReadBuffer(0, ps);
+                    } else {
+                        bbb = readPageWithNumber(page, ps);
+                    }
+                    if (bbb == null) {
+                        break;
+                    }
+                    try {
+                        /* start reading the schema string from the correct position */
+                        aux.readMasterTableRecord(starthere, bbb, headerSize);
+                    } catch (RuntimeException e) {
+                        debug("Could not read schema record at ", index, ": ", e);
                     }
                 }
                 /* search for more component entries */
@@ -1068,8 +1076,8 @@ public class Job extends Base {
 		info("Start with scan...");
 		/* create a new threadpool to analyze the freepages */
 		ExecutorService executor = null;
-		if (Global.numberofThreads > 0) {
-			executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(Global.numberofThreads);
+		if (getNumberOfThreads() > 0) {
+			executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(getNumberOfThreads());
 		}
 
 		long begin = System.currentTimeMillis();
@@ -1079,17 +1087,27 @@ public class Job extends Base {
 		
 		for (int cc = 1; cc < pages.length; cc++) {
 			
-			if (null == pages[cc]) 
+			if (freelistPages.contains(cc) || (null == pages[cc] && btreePages.contains(cc)))
 			{
 				debug("page ", cc, " is no regular leaf page component. Maybe a indices or overflow or dropped component page.");
-				//System.out.println("page " + cc + " offset " + ((cc-1)*ps) + " is no regular leaf page component. Maybe a indices or overflow or dropped component page.");
+			}
+			else if (null == pages[cc])
+			{
+				/* not referenced by any b-tree nor by the freelist: e.g. the schema entry of its table was lost */
+				if (isUnreferencedTableLeaf(cc)) {
+					debug("page ", cc, " is an unreferenced table leaf page.");
+					RecoveryTask task = new RecoveryTask(aux, this, (long) (cc - 1) * ps, cc, ps, false, recoveryTables);
+					task.setUnreferencedPage(true);
+					tasks.add(task);
+					runningTasks.incrementAndGet();
+				}
 			} 
 			else 
 			{
 				debug("page ", cc, " is a regular leaf page. ");
 
 				// determine offset for free page
-				long offset = (cc - 1) * ps;
+				long offset = (long) (cc - 1) * ps;
 
 				//System.out.println("************************ pagenumber " + cc + " " + offset);
 
@@ -1099,7 +1117,7 @@ public class Job extends Base {
 			}
 		}
 		if (executor != null) {
-			debug("Task total: ", runningTasks.intValue(), " worker threads ", Global.numberofThreads);
+			debug("Task total: ", runningTasks.intValue(), " worker threads ", getNumberOfThreads());
 		}
 		
 		int c = 1;
@@ -1111,7 +1129,8 @@ public class Job extends Base {
 				/* add new task to executor queue */
 				executor.execute(t);
 			} else {
-            	t.runSingleThread();
+				/* errors are logged - a corrupted page must not stop the recovery */
+				t.run();
 			}
 		}
 
@@ -1128,7 +1147,7 @@ public class Job extends Base {
 		finally {
 			if (executor != null) {
 				if (!executor.isTerminated()) {
-					System.err.println("cancel non-finished tasks");
+					getLogger().error("cancel non-finished tasks");
 				}
 				executor.shutdownNow();
 				info("shutdown finished");
@@ -1141,6 +1160,68 @@ public class Job extends Base {
 		
 		
 
+	}
+
+	/**
+	 * @return the usable size of a database page, i.e. the page size minus the
+	 *         reserved space at the end of each page
+	 */
+	public int getUsablePageSize() {
+		return ps - (reservedspace & 0xFF);
+	}
+
+	/* number of worker threads of this job, null: use Global.numberofThreads */
+	private Integer numberOfThreads = null;
+
+	/**
+	 * Set the number of worker threads used by this job (0: run in the calling thread).
+	 * By default, {@link Global#numberofThreads} is used.
+	 * 
+	 * @param numberOfThreads the number of worker threads
+	 */
+	public void setNumberOfThreads(int numberOfThreads) {
+		this.numberOfThreads = numberOfThreads;
+	}
+
+	/**
+	 * @return the number of worker threads used by this job
+	 */
+	public int getNumberOfThreads() {
+		return numberOfThreads != null ? numberOfThreads : Global.numberofThreads;
+	}
+
+	/**
+	 * Check if a page looks like a table leaf page with a consistent page header.
+	 * Overflow pages and pointer map pages do not pass this test.
+	 * 
+	 * @param pagenumber the page number
+	 * @return true, if the page is a plausible table leaf page
+	 */
+	private boolean isUnreferencedTableLeaf(int pagenumber) throws IOException {
+		if (pagenumber == 1)
+			return false;
+		ByteBuffer page = readPageWithNumber(pagenumber - 1, ps);
+		if (page == null || page.get(0) != 0x0D)
+			return false;
+		int usable = getUsablePageSize();
+		int freeblock = page.getShort(1) & 0xFFFF;
+		int cells = page.getShort(3) & 0xFFFF;
+		int content = page.getShort(5) & 0xFFFF;
+		if (content == 0)
+			content = 65536;
+		int fragmented = page.get(7) & 0xFF;
+		int headerend = 8 + 2 * cells;
+		if (cells == 0 || headerend > content || content > usable || fragmented > 60)
+			return false;
+		if (freeblock != 0 && (freeblock < headerend || freeblock + 4 > usable))
+			return false;
+		/* all cells must be located in the cell content area */
+		for (int i = 0; i < cells; i++) {
+			int cell = page.getShort(8 + 2 * i) & 0xFFFF;
+			if (cell < content || cell >= usable)
+				return false;
+		}
+		return true;
 	}
 
 	public void setPath(String path) {
@@ -1165,7 +1246,8 @@ public class Job extends Base {
 			try {
 				run(path);
 			} catch (Exception e) {
-				e.printStackTrace();
+				/* always reported (independent of LOGLEVEL), like the stack trace printed before */
+				getLogger().error("Error while processing " + path, e);
 			}
 		else
 			return;
@@ -1193,7 +1275,8 @@ public class Job extends Base {
 		try {
 			hashcode = processDB();
 		} catch (InterruptedException | ExecutionException | IOException e) {
-			e.printStackTrace();
+			/* always reported (independent of LOGLEVEL), like the stack trace printed before */
+			getLogger().error("Error while processing " + p, e);
 		}
 		long end = System.currentTimeMillis();
 		info("Duration in ms: ", (end - start));
@@ -1238,7 +1321,7 @@ public class Job extends Base {
 		{
 		   return null;
 		}
-		return readPageWithOffset(pagenumber*pagesize, pagesize);
+		return readPageWithOffset(pagenumber * (long) pagesize, pagesize);
 	}	
 	
 	/**
@@ -1247,100 +1330,80 @@ public class Job extends Base {
      * for primary and secondary indexes on database relations. 
      * 
      * This method can be called to traverse all nodes of 
-     * a table-tree. 
+     * a table-tree or an index-tree. Every page is visited at most once,
+     * so corrupted trees with cycles can not lead to an endless loop.
      * 
-     * Attention! This is a recursive function. 
-     * 
-     * 
-     * @param pageNumber  the page number
+     * @param rootPage  the page number of the root page
      * @param visitor   visitor to act on leaf pages 
      * @throws IOException ioException
      */
-    private void exploreBTree(int pageNumber, BTreePageVisitor visitor) throws IOException {
-        
-        // pagesize * (rootindex - 1) -> go to the start of this page
-        int fileOffset = ps * (pageNumber - 1);
+    private void exploreBTree(int rootPage, BTreePageVisitor visitor) throws IOException {
+        exploreBTree(rootPage, visitor, false);
+    }
 
-        if(fileOffset < 0 || pageNumber < 0)
-            return;
-        
-        if (fileOffset >= file.size()) {
-            return;
-        }
-        
-        int pageHeaderOffset = 0;
-        if (pageNumber == 1) {
-            pageHeaderOffset = 100;
-        }
+    /**
+     * Traverse a b-tree.
+     * 
+     * @param rootPage      the page number of the root page
+     * @param visitor       visitor to act on leaf pages
+     * @param indexInterior true to descend into interior pages of index b-trees and to visit them too:
+     *                      the b-tree of a WITHOUT ROWID table is an index b-tree, its interior pages
+     *                      hold records as well
+     * @throws IOException ioException
+     */
+    private void exploreBTree(int rootPage, BTreePageVisitor visitor, boolean indexInterior) throws IOException {
 
-        // first byte of page
-        file.position(fileOffset + pageHeaderOffset);
-        byte pageType = file.get();
+        Deque<Integer> stack = new ArrayDeque<>();
+        Set<Integer> visited = new HashSet<>();
+        stack.push(rootPage);
 
-        /* check type of the page by reading the first byte */
-        int typ = Auxiliary.getPageType(pageType);
+        while (!stack.isEmpty()) {
+            int pageNumber = stack.pop();
 
-        /* not supported yet */
-        if (typ == 2) {
-            debug(" page number", pageNumber, " is a  INDEXINTERIORPAGE.");
-        } else if (typ == 12) {
-            /* type is either a data interior page (12) */
-            debug("page number ", pageNumber, " is a interior data page ");
+            if (pageNumber <= 0 || pageNumber > numberofpages || !visited.add(pageNumber))
+                continue;
+            btreePages.add(pageNumber);
 
-            /* now we have to read the cell pointer list with offsets for the other pages */
-
-            /* read the complete internal page into buffer */
-            //System.out.println(" read internal page at offset " + ((root-1)*ps));
             ByteBuffer buffer = readPageWithNumber(pageNumber - 1, ps);
-            if (buffer == null) {
-                return;
+            if (buffer == null)
+                continue;
+
+            int pageHeaderOffset = (pageNumber == 1) ? 100 : 0;
+
+            /* check type of the page by reading the first byte */
+            int typ = Auxiliary.getPageType(buffer.get(pageHeaderOffset));
+
+            if (typ == 12 || (typ == 2 && indexInterior)) {
+                /* interior page of a table (12) or of an index (2) */
+                debug("page number ", pageNumber, " is an interior page ");
+                if (typ == 2)
+                    visitor.visitLeafPage(pageNumber);
+
+                int e = buffer.getShort(pageHeaderOffset + 3) & 0xFFFF;
+                List<Integer> children = new ArrayList<>();
+
+                /* go on with the cell pointer array */
+                for (int i = 0; i < e; i++) {
+                    int pointer = pageHeaderOffset + 12 + 2 * i;
+                    if (pointer + 2 > buffer.limit())
+                        break;
+                    int celloff = buffer.getShort(pointer) & 0xFFFF;
+                    /* each cell starts with the page number of the left child */
+                    if (celloff + 4 > buffer.limit())
+                        continue;
+                    children.add(buffer.getInt(celloff));
+                }
+                /* the right most child pointer is part of the page header */
+                children.add(buffer.getInt(pageHeaderOffset + 8));
+
+                /* visit the children in their order */
+                for (int i = children.size() - 1; i >= 0; i--)
+                    stack.push(children.get(i));
             }
-
-            byte[] numberofcells = new byte[2];
-            buffer.position(pageHeaderOffset + 3);
-
-            buffer.get(numberofcells);
-            int e = Auxiliary.TwoByteBuffertoInt(numberofcells);              
-
-            /* go on with the cell pointer array */
-            for (int i = 0; i < e; i++) {
-
-                // address of the next cell pointer
-                byte [] celladdr = new byte[2];
-                buffer.position(pageHeaderOffset + 12 + 2 * i);
-                if (buffer.capacity() <= buffer.position()+2)
-                    continue;
-                buffer.get(celladdr);
-                int celloff = Auxiliary.TwoByteBuffertoInt(celladdr);
-
-                // read page number of next node in the btree
-                byte pnext[] = new byte[4];
-                if (celloff >= buffer.capacity() || celloff < 0)
-                    continue;
-                if (celloff > ps)
-                    continue;
-                buffer.position(celloff);
-                buffer.get(pnext);
-                int p = ByteBuffer.wrap(pnext).getInt();
-                // unfolding the next level of the tree
-                debug(" child page ", p);
-                exploreBTree(p, visitor);
+            else if (typ == 8 || typ == 10) {
+                debug("page number ", pageNumber, " is a leaf page set component/index to sqlite schema ");
+                visitor.visitLeafPage(pageNumber);
             }
-            
-            ByteBuffer rightChildptr = file.allocateAndReadBuffer(fileOffset + pageHeaderOffset + 8, 4);
-            
-            if (rightChildptr != null) {
-                /* recursive */
-                exploreBTree(rightChildptr.getInt(), visitor);
-            }
-
-        } 
-        else if (typ == 8 || typ == 10) {
-            debug("page number ", pageNumber, " is a leaf page set component/index to sqlite schema ");
-            if (pageNumber >  numberofpages)
-                return;
-            
-            visitor.visitLeafPage(pageNumber);
         }
     }
 
@@ -1391,6 +1454,8 @@ public class Job extends Base {
             filename = "results" + name + date + ".csv";
         }
         
+        /* do not change the order of the array of the caller */
+        lines = Arrays.copyOf(lines, lines.length);
         Arrays.sort(lines);
 
         /** convert line to UTF-8 **/
@@ -1399,7 +1464,8 @@ public class Job extends Base {
             final File file = new File(filename);
             
             
-            try (final BufferedWriter writer = Files.newBufferedWriter(file.toPath(),Charset.forName("UTF-8"), StandardOpenOption.CREATE)) 
+            try (final BufferedWriter writer = Files.newBufferedWriter(file.toPath(),StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) 
             {
               for (String line: lines)
               { 
@@ -1408,12 +1474,218 @@ public class Job extends Base {
             }
             
         } catch (IOException e) {
-            e.printStackTrace();
+            getLogger().error("Could not write the results to " + filename, e);
         }
 
     }
 
+    /* recovery of deleted records from index entries */
+    private IndexEntryRecovery indexRecovery = null;
+
+    /* records collected until the versions of the pages are resolved (null: add immediately) */
+    private volatile Queue<SqliteInternalRow> collectedRows = null;
+
+    private static boolean isNonEmptyFile(String file, long minSize) {
+        try {
+            Path p = Paths.get(file);
+            return Files.isRegularFile(p) && Files.size(p) > minSize;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+
+    private static final long FNV_OFFSET = 0xcbf29ce484222325L;
+    private static final long FNV_PRIME = 0x100000001b3L;
+
+    private static long hash(long h, String s) {
+        for (int i = 0; i < s.length(); i++) {
+            h ^= s.charAt(i);
+            h *= FNV_PRIME;
+        }
+        return h;
+    }
+
+    private static long hash(long h, long v) {
+        for (int i = 0; i < 8; i++) {
+            h ^= (v >>> (8 * i)) & 0xFF;
+            h *= FNV_PRIME;
+        }
+        return h;
+    }
+
+    /** 64 bit hash of a value: its raw bytes (equal values have equal bytes in SQLite records). */
+    private static long hash(long h, SqliteElementData d) {
+        h = hash(h, 0x5A5AL);
+        byte[] b = d == null ? null : d.getBlobValue();
+        if (b == null || (b.length == 0 && d.getObject(false) == null))
+            return hash(h, -1L);
+        for (byte x : b) {
+            h ^= x & 0xFF;
+            h *= FNV_PRIME;
+        }
+        return hash(h, b.length);
+    }
+
+    /**
+     * Key identifying a record: table, rowid and values (64 bit hash).
+     */
+    private static long recordKey(SqliteInternalRow row) {
+        long h = hash(FNV_OFFSET, row.getTableName());
+        h = hash(h, row.getRowId());
+        for (SqliteElementData d : row.getRowData())
+            h = hash(h, d);
+        return h;
+    }
+
+    /**
+     * @return true, if the record was read from the cell pointer array of a page version
+     *         which is not the current one (a newer version of the page exists in the WAL file,
+     *         or it is an old frame of the WAL file or a page of the rollback journal)
+     */
+    private boolean isOldPageVersion(SqliteInternalRow row, Map<Integer, Integer> currentFrames) {
+        switch (row.getSource()) {
+            case DATABASE:
+                return currentFrames.containsKey((int) (row.getOffset() / ps) + 1);
+            case WAL:
+                if (wal == null)
+                    return false;
+                int idx = wal.frameIndex(row.getOffset());
+                if (idx < 0 || idx >= wal.frames.size())
+                    return true;
+                Integer current = currentFrames.get(wal.frames.get(idx).pagenumber);
+                return current == null || current != idx;
+            default:
+                /* the rollback journal holds former versions of pages */
+                return true;
+        }
+    }
+
+    /**
+     * Compare the records of the different versions of the pages (database file, WAL
+     * frames, rollback journal). The records found in the current version of the pages
+     * form the current state of the database. A record of an old page version
+     * <ul>
+     * <li>which is part of the current state is only a copy - it is not reported again</li>
+     * <li>which is not part of the current state was deleted or changed - it is reported
+     * as deleted record</li>
+     * </ul>
+     */
+    private void resolvePageVersions() {
+        Queue<SqliteInternalRow> rows = collectedRows;
+        collectedRows = null;
+        if (rows == null)
+            return;
+
+        Map<Integer, Integer> currentFrames = wal != null ? wal.currentFrames() : Collections.emptyMap();
+
+        Set<SqliteInternalRow> old = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (SqliteInternalRow row : rows) {
+            if (!row.isDeletedRow() && isOldPageVersion(row, currentFrames))
+                old.add(row);
+        }
+        /* the keys of the current records are only needed if there are old page versions */
+        Set<Long> current = new HashSet<>();
+        if (!old.isEmpty()) {
+            for (SqliteInternalRow row : rows) {
+                if (!row.isDeletedRow() && !old.contains(row))
+                    current.add(recordKey(row));
+            }
+        }
+
+        Set<Long> reported = new HashSet<>();
+        List<SqliteInternalRow> result = new ArrayList<>(rows.size());
+        Set<Integer> indexPages = indexRecovery != null ? indexRecovery.attributedPages : Collections.emptySet();
+        boolean deletedRecords = false;
+        for (SqliteInternalRow row : rows) {
+            /* records of freelist pages attributed to an index are reported as index entries */
+            if (!indexPages.isEmpty() && row.getSource() == RecordSource.DATABASE
+                    && "__UNASSIGNED".equals(row.getTableName()) && indexPages.contains((int) (row.getOffset() / ps) + 1))
+                continue;
+            if (old.contains(row)) {
+                long key = recordKey(row);
+                /* a copy of a current record, or the same old record in several page versions */
+                if (current.contains(key) || !reported.add(key))
+                    continue;
+                row.setRecordType(Global.DELETED_RECORD_IN_PAGE + row.getRecordType());
+            }
+            deletedRecords |= row.isDeletedRow();
+            result.add(row);
+        }
+
+        /* the values (and rowids) of the current records, to detect copies of them */
+        Map<Long, Set<Long>> live = new HashMap<>();
+        if (!keepCopiesOfLiveRecords && deletedRecords) {
+            for (SqliteInternalRow row : result) {
+                if (!row.isDeletedRow()) {
+                    long key = contentKey(row);
+                    if (key != NO_KEY)
+                        live.computeIfAbsent(key, k -> new HashSet<>()).add(row.getRowId());
+                }
+            }
+        }
+        List<SqliteInternalRow> fromIndices = indexRecovery != null ? indexRecovery.select(result) : Collections.emptyList();
+        indexRecovery = null;
+        for (SqliteInternalRow row : result) {
+            if (!live.isEmpty() && row.isDeletedRow() && isCopyOfLiveRecord(row, live))
+                continue;
+            addRowNow(row);
+        }
+        for (SqliteInternalRow row : fromIndices)
+            addRowNow(row);
+    }
+
+    private static final long NO_KEY = Long.MIN_VALUE;
+
+    /**
+     * Key of the values of a record without the rowid (and the column alias for the rowid,
+     * which is usually lost for carved records), NO_KEY if the record has less than two values.
+     */
+    private long contentKey(SqliteInternalRow row) {
+        int alias = -1;
+        TableDescriptor td = headers.get(row.getTableName());
+        if (td != null && td.rowidcolumn != null)
+            alias = td.columnnames.indexOf(td.rowidcolumn);
+        long h = hash(FNV_OFFSET, row.getTableName());
+        int values = 0;
+        List<SqliteElementData> data = row.getRowData();
+        for (int i = 0; i < data.size(); i++) {
+            if (i == alias)
+                continue;
+            SqliteElementData d = data.get(i);
+            byte[] b = d == null ? null : d.getBlobValue();
+            if (b != null && (b.length > 0 || d.getObject(false) != null))
+                values++;
+            h = hash(h, d);
+        }
+        return values < 2 ? NO_KEY : h;
+    }
+
+    /** A deleted record with the values of a current record (and the same rowid, if it is known). */
+    private boolean isCopyOfLiveRecord(SqliteInternalRow row, Map<Long, Set<Long>> live) {
+        long key = contentKey(row);
+        if (key == NO_KEY)
+            return false;
+        Set<Long> rowids = live.get(key);
+        if (rowids == null)
+            return false;
+        return row.getRowId() == Long.MIN_VALUE || rowids.contains(row.getRowId());
+    }
+
     public void addRow(SqliteInternalRow row) {
+        Queue<SqliteInternalRow> collected = collectedRows;
+        if (collected != null) {
+            collected.add(row);
+            return;
+        }
+        addRowNow(row);
+    }
+
+    private void addRowNow(SqliteInternalRow row) {
+        /* a deleted record with only NULL values holds no information (e.g. carved from zeroed space) */
+        if (row.isDeletedRow() && Auxiliary.isEmptyRow(row)) {
+            return;
+        }
         row.setColumnNamesMap(getColIdxMapForTable(row.getTableName()));
 		if (recoverOnlyDeletedRecords) {
 			// only add rows that are marked as deleted
@@ -1431,7 +1703,7 @@ public class Job extends Base {
             }
             SqliteRow decoded = row.decodeRow();
             decoded.setCharset(db_encoding);
-            tables.add(row.decodeRow());
+            tables.add(decoded);
 		}
     }
 
@@ -1441,34 +1713,18 @@ public class Job extends Base {
 
     public List<SqliteRow> getRowsForTable(String tableName) {
         synchronized (lock) {
-            return tableRows.getOrDefault(tableName, Collections.emptyList());
+            /* a copy - the recovery may still add rows (WAL/journal readers, worker threads) */
+            return new ArrayList<>(tableRows.getOrDefault(tableName, Collections.emptyList()));
         }
     }
 
     public synchronized Set<String> getTablesNames() {
         synchronized (lock) {
-            return tableRows.keySet();
+            return new LinkedHashSet<>(tableRows.keySet());
         }
     }
     
     private interface BTreePageVisitor {
         void visitLeafPage(int pageNumber) throws IOException;
     }
-}
-
-
-
-
-class Signatures {
-
-	static String getTable(String signature) {
-
-		signature = signature.trim();
-
-		signature = signature.replaceAll("[0-9]", "");
-
-		signature = signature.replaceAll("PRIMARY_KEY", "");
-
-		return signature;
-	}
 }

@@ -6,7 +6,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.BitSet;
 import java.util.LinkedList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -16,6 +18,7 @@ import fqlite.descriptor.TableDescriptor;
 import fqlite.pattern.SerialTypeMatcher;
 import fqlite.types.CarverTypes;
 import fqlite.util.Auxiliary;
+import fqlite.util.FreeblockReconstructor;
 import fqlite.util.RandomAccessFileReader;
 
 /**
@@ -150,6 +153,16 @@ public abstract class WALReaderBase extends Base {
 			return;
 		}
 
+		try {
+			parseFrames(framenumber);
+		} finally {
+			file.close();
+		}
+	}
+
+	private void parseFrames(int framenumber) throws IOException {
+
+		size = file.size();
 
         if(file.size() <= 32)
         {   
@@ -159,6 +172,9 @@ public abstract class WALReaderBase extends Base {
 		
 		/* read header of the WAL file - the first 32 bytes */
 		buffer = file.allocateAndReadBuffer(0, 32);
+		if (buffer == null) {
+			return;
+		}
 
 		/* 
 		 * WAL Header Format:
@@ -219,6 +235,11 @@ public abstract class WALReaderBase extends Base {
 		 */
 		if (ps == 0 || ps == 1)
 			ps = 65536;
+
+		if (ps < 512 || ps > 65536 || (ps & (ps - 1)) != 0) {
+			err("Invalid page size in WAL header: ", ps);
+			return;
+		}
 
 		info("page size ", ps, " Bytes ");
 
@@ -297,7 +318,10 @@ public abstract class WALReaderBase extends Base {
 		{
 			/* 24 Byte - with six 4-Byte big endian values */
 			ByteBuffer fheader = file.allocateAndReadBuffer(framestart, 24);
-	
+			if (fheader == null) {
+				break;
+			}
+
 			/* get the page number of this frame */
 			pagenumber_maindb = fheader.getInt();
 			
@@ -347,15 +371,18 @@ public abstract class WALReaderBase extends Base {
 			WALFrame frame = updateCheckpoint(pagenumber_maindb, framenumber,fsalt1, fsalt2,(commit==0)? false: true);
 			
 			
-			analyzePage(frame);
+			try {
+				analyzePage(frame);
+			} catch (RuntimeException e) {
+				/* corrupted frame - go on with the next one */
+				err("Error while analyzing WAL frame ", framenumber, ": ", e);
+			}
 
-
-			
 			framestart += ps +  24;
-			
-		
+
+
 			/*  More pages to analyze ? */
-			if(framestart+24+ps < size)
+			if(framestart+24+ps <= size)
 			{
 				
 				next = true;
@@ -374,9 +401,45 @@ public abstract class WALReaderBase extends Base {
 		info("Checkpoints ", checkpoints);
 	}
 	
+	/* all frames in the order of the file */
+	List<WALFrame> frames = new java.util.ArrayList<WALFrame>();
+
+	/**
+	 * Determine the current version of each database page in the WAL file: the last
+	 * valid frame (salt values of the WAL header) of a page which is not behind the
+	 * last commit frame. Older frames, frames of former checkpoints (other salt values)
+	 * and uncommitted frames do not belong to the current state of the database.
+	 * 
+	 * @return map: page number -> index of the frame holding the current version
+	 */
+	Map<Integer, Integer> currentFrames() {
+		int lastCommit = -1;
+		for (int i = 0; i < frames.size(); i++) {
+			WALFrame f = frames.get(i);
+			if (f.salt1 == hsalt1 && f.salt2 == hsalt2 && f.committed)
+				lastCommit = i;
+		}
+		Map<Integer, Integer> current = new HashMap<Integer, Integer>();
+		for (int i = 0; i <= lastCommit; i++) {
+			WALFrame f = frames.get(i);
+			if (f.salt1 == hsalt1 && f.salt2 == hsalt2)
+				current.put(f.pagenumber, i);
+		}
+		return current;
+	}
+
+	/**
+	 * @param offset offset in the WAL file
+	 * @return the index of the frame containing the offset
+	 */
+	int frameIndex(long offset) {
+		return (int) ((offset - 32) / (ps + 24));
+	}
+
 	private WALFrame updateCheckpoint(int pagenumber, int framenumber,long salt1, long salt2, boolean committed){
 		
 		WALFrame f = new WALFrame(pagenumber, framenumber , salt1, salt2,  committed);
+		frames.add(f);
 
 		
 		/* new checkpoint/transaction id? */
@@ -402,13 +465,24 @@ public abstract class WALReaderBase extends Base {
 	 * @param frame the WALFrame object
 	 * @return int success
 	 */
+	private boolean isWithoutRowidTablePage(int pagenumber) {
+		if (pagenumber > 0 && pagenumber < job.pages.length) {
+			AbstractDescriptor ad = job.pages[pagenumber];
+			return ad instanceof TableDescriptor && !ad.ROWID;
+		}
+		return false;
+	}
+
 	public int analyzePage(WALFrame frame) {
 		
 		withoutROWID = false;
 
+		/* every frame holds a different page -> start with a clean state */
+		visit = new BitSet(ps);
+		firstcol.setLength(0);
+
 		buffer.position(0);
 		byte pageType = buffer.get();
-		buffer.get(pageType);
 
 		// offset 0
 		buffer.position(0);
@@ -466,6 +540,13 @@ public abstract class WALReaderBase extends Base {
 			info("Index leaf page ", pagenumber_wal);
 			// note: WITHOUT ROWID tables are saved here.
 			withoutROWID = true;
+		} else if (type == 2) {
+			/* interior pages of index b-trees: only the ones of WITHOUT ROWID tables hold table records */
+			if (!isWithoutRowidTablePage(pagenumber_maindb)) {
+				info("Index interior page ", pagenumber_wal);
+				return -1;
+			}
+			withoutROWID = true;
 		} else {
 			info("Data page ", pagenumber_wal, " Offset: ", (file.position()));
 		}
@@ -492,9 +573,13 @@ public abstract class WALReaderBase extends Base {
 		// get start pointer for the cell content region
 		byte ccr[] = new byte[2];
 		buffer.position(5);
+		buffer.get(ccr);
 
 		ByteBuffer contentregionstart = ByteBuffer.wrap(ccr);
 		ccrstart = Auxiliary.TwoByteBuffertoInt(contentregionstart);
+		/* a value of zero means 65536 */
+		if (ccrstart == 0)
+			ccrstart = 65536;
 
 
 		/* mark as visited */
@@ -502,13 +587,17 @@ public abstract class WALReaderBase extends Base {
 
 		ByteBuffer size = ByteBuffer.wrap(cpn);
 		int cp = Auxiliary.TwoByteBuffertoInt(size);
+		/* the cell pointer array can not be larger than the page (corrupted page) */
+		/* interior pages have a 12 byte header (with the right most child pointer) */
+		int pageheader = (type == 2) ? 12 : 8;
+		cp = Math.min(cp, (ps - pageheader) / 2);
 
 		debug(" number of cells: ", cp, " type of page ", type);
 		job.numberofcells.addAndGet(cp);
 		if (0 == cp)
 			debug(" Page seems to be dropped. No cell entries.");
 
-		int headerend = 8 + (cp * 2);
+		int headerend = pageheader + (cp * 2);
 		visit.set(0, headerend);
 		info("headerend:", headerend);
 
@@ -519,16 +608,14 @@ public abstract class WALReaderBase extends Base {
 		 * 
 		 ***************************************************************/
 		int last = 0;
+		java.util.Map<Integer, java.util.Map<Integer, Integer>> textLengths = new java.util.HashMap<>();
 
 		/* go on with the cell pointer array */
 		for (int i = 0; i < cp; i++) {
 
 			// address of the next cell pointer
 			byte pointer[] = new byte[2];
-			if (type == 5)
-				buffer.position(12 + 2 * i);
-			else
-				buffer.position(8 + 2 * i);
+			buffer.position(pageheader + 2 * i);
 			buffer.get(pointer);
 			ByteBuffer celladdr = ByteBuffer.wrap(pointer);
 			int celloff = Auxiliary.TwoByteBuffertoInt(celladdr);
@@ -541,101 +628,56 @@ public abstract class WALReaderBase extends Base {
 			last = celloff;
 			
 			SqliteInternalRow row = null;
-			
 
-			try { 
-				row = ct.readRecord(celloff, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID,framestart+24);
-			} catch (IOException e) {
-				e.printStackTrace();
+			/* cells of interior index pages start with the 4 byte page number of the left child */
+			int recordstart = (type == 2) ? celloff + 4 : celloff;
+			if (celloff > 0 && recordstart < buffer.limit()) {
+				if (type == 2)
+					visit.set(celloff, recordstart);
+				try {
+					row = ct.readRecord(recordstart, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID,framestart+24);
+				} catch (IOException | RuntimeException e) {
+					debug("Could not read cell at offset ", celloff, " of WAL frame ", frame.framenumber, ": ", e);
+				}
 			}
 
-			/* adding WAL-Frame fields to output line */
-			
-			String info = frame.committed + "," + frame.pagenumber + "," + frame.framenumber + "," + frame.salt1 + "," +  frame.salt2;
-			row.setLineSuffix("#walframe#" + info);
-			//System.out.println("***********  " + rc);
-					
 			// add new line to output
 			if (null != row) {
 
-				int p1;
-				String tableName = row.getTableName();
-				if ((p1 = tableName.indexOf("_node;")) > 0) {
-					String tbln = tableName.substring(0, p1);
+				/* adding WAL-Frame fields to output line */
+				String info = frame.committed + "," + frame.pagenumber + "," + frame.framenumber + "," + frame.salt1 + "," +  frame.salt2;
+				row.setLineSuffix("#walframe#" + info);
+				row.setSource(RecordSource.WAL);
 
-					if (job.virtualTables.containsKey(tbln)) {
-						TableDescriptor tds = job.virtualTables.get(tbln);
-
-						/*
-						 * we use the xxx_node shadow component to construct the virtual component
-						 */
-						//String BLOB = rc.substring(p1);
-						//System.out.println(BLOB);
-
-						/*
-						 * skip the first information -> go directly to the 5th element of the data
-						 * record line, i.e. go to the BLOB with the row data
-						 */
-						//int pp = Auxiliary.findNthOccur(rc, ';', 4);
-						String data = row.getRowData().get(1).toString();
-
-						/* transform String data into an byte array */
-						byte[] binary = Auxiliary.decode(data);
-						ByteBuffer bf = ByteBuffer.wrap(binary);
-
-						/* skip the first to bytes */
-						bf.getShort();
-						/* first get the total number of entries for this rtree branch */
-						int entries = bf.getShort();
-
-						/* create a new line for every data row */
-						while (entries > 0) {
-							SqliteInternalRow vrow = new SqliteInternalRow();
-							vrow.setTableName(tbln);
-							vrow.setRecordType("VT");
-							vrow.setOffset(0);
-							//vrow.append(tbln + ";VT;0;"); // start a new row for the virtual component
-
-							// The first column is always a 64-bit signed integer primary key.
-							long primarykey = bf.getLong();
-							//vrow.append(primarykey + ";");
-							vrow.append(new SqliteElementData(primarykey, job.db_encoding));
-
-							// Each R*Tree indices is a virtual component with an odd number of columns
-							// between 3 and 11
-							// The other columns are pairs, one pair per dimension, containing the minimum
-							// and maximum values for that dimension, respectively.
-							int number = tds.columnnames.size() - 1;
-
-							while (number > 0) {
-								float rv = bf.getFloat();
-								//vrow.append(rv + ";");
-								vrow.append(new SqliteElementData(rv, job.db_encoding));
-								number--;
-							}
-
-							//vrow.append("\n");
-							output.add(vrow);
-
-							//System.out.println(vrow);
-
-							entries--;
-
-						}
-
-					}
-
+				/* R*Tree virtual table: decode the entries of the shadow node table */
+				for (SqliteInternalRow vrow : RTreeDecoder.decode(job, row)) {
+				    output.add(vrow);
+				    job.addRow(vrow);
 				}
 				//rc = frame.framenumber + ";" + frame.pagenumber + ";" + frame.salt1 + ";" + rc;
 
-				
+
 				output.add(row);
+				/* make the record available through the Job API too */
+				FreeblockReconstructor.addTextLengths(textLengths, row);
+				job.addRow(row);
 			}
 
 		} // end of for - cell pointer
 
 		
 		debug("finished STEP2 -> cellpoint array completed");
+
+		/* deleted records in the freeblocks: reconstructed with the bounds of the freeblocks and the schema */
+		if ((type == 8 || type == 10) && pagenumber_maindb > 0 && pagenumber_maindb < job.pages.length
+				&& job.pages[pagenumber_maindb] instanceof TableDescriptor && (type == 8) == job.pages[pagenumber_maindb].ROWID) {
+			try {
+				FreeblockReconstructor.recoverFreeblocks(ct, buffer, (TableDescriptor) job.pages[pagenumber_maindb], type == 10,
+						textLengths, visit, framestart + 24L, RecordSource.WAL, job::addRow);
+			} catch (RuntimeException e) {
+				debug("Could not reconstruct the freeblocks of page ", frame.framenumber, ": ", e);
+			}
+		}
 		
 	try 
 	{	
@@ -659,22 +701,26 @@ public abstract class WALReaderBase extends Base {
 		 *  artifacts in the unallocated space. 
 		 */
 		
+		/* the unallocated area ends where the cell content area starts - never read into the cells */
+		int unallocatedEnd = Math.min(ccrstart, ps);
+
 		byte garbage[] = new byte[2];
 		
 		int garbageoffset = -1;
 		do
 		{
-			
+			if (buffer.remaining() < 2 || buffer.position() + 2 > unallocatedEnd)
+				break;
 			buffer.get(garbage);
 			ByteBuffer ignore = ByteBuffer.wrap(garbage);
 			garbageoffset = Auxiliary.TwoByteBuffertoInt(ignore);
 			//System.out.println("garbage bytes " + buffer.position());
-		} while (buffer.position() < ps && garbageoffset > 0);
+		} while (buffer.position() < unallocatedEnd && garbageoffset > 0);
 		
 		
 		/*  Now, skip all zeros - no information to recover just empty space */
 		byte zerob = 0;
-		while(buffer.position() < ps && zerob == 0)
+		while (buffer.position() < unallocatedEnd && zerob == 0)
 		{
 			zerob = buffer.get();
 		}
@@ -698,14 +744,13 @@ public abstract class WALReaderBase extends Base {
 			
 			/* Tricky thing : data record could be partly overwritten with a new data record!!!  */
 			/* We should read until the end of the unallocated area and not above! */
-			row = ct.readRecord(buffer.position(), buffer, ps, visit, type, ccrstart - buffer.position(),firstcol,withoutROWID,-1);
-			
+			row = ct.readRecord(buffer.position(), buffer, pagenumber_maindb, visit, type, ccrstart - buffer.position(),firstcol,withoutROWID,framestart+24);
+
 			// add new line to output
 			if (null != row) { // && rc.length() > 0) {
-				
-				//int idx = rc.indexOf(";");
-				//rc = rc.substring(0, idx) + ";" + Global.DELETED_RECORD_IN_PAGE  + rc.substring(idx+1);
+
 				row.setRecordType(Global.DELETED_RECORD_IN_PAGE + row.getRecordType());
+				row.setSource(RecordSource.WAL);
 				   					
 				
 				//if (job.doublicates.add(rc.hashCode()))
@@ -727,7 +772,7 @@ public abstract class WALReaderBase extends Base {
 		carve(null);
 		
 	} catch (Exception err) {
-		err.printStackTrace();
+		getLogger().error("Error while carving WAL frame " + frame.framenumber, err);
 		return -1;
 	}
 
@@ -761,7 +806,8 @@ public abstract class WALReaderBase extends Base {
 	 * @throws IOException if an error occurs
 	 */
 	protected ByteBuffer readPage() throws IOException {
-		return file.allocateAndReadBuffer(ps);
+		/* the page follows immediately after the 24 byte frame header */
+		return file.allocateAndReadBuffer(framestart + 24, ps);
 	}
 
 	/**
@@ -771,140 +817,9 @@ public abstract class WALReaderBase extends Base {
 	 * @param crv the Carver object
 	 */
 	public void carve(ByteBuffer buffer, Carver crv) {
-
-		Carver c = crv;
-
-		if (null == c)
-			/* no type could be found in the first byte */
-			/* Maybe the whole page was drop because of a drop component command ? */
-			/* start carving on the complete page */
-			c = new Carver(job, buffer, visit, ps);
-
-		// Matcher mat = null;
-		// boolean match = false;
-
-		/* try to get component schema for the current page, if possible */
-		TableDescriptor tdesc = null;
-		if (job.pages.length > ps) {
-			AbstractDescriptor ad = job.pages[ps];
-			if (ad instanceof TableDescriptor)
-				tdesc = (TableDescriptor) ad;
-		}
-
-		List<TableDescriptor> tab = tables;
-		debug(" tables :: ", tables.size());
-
-		if (null != tdesc) {
-			/* there is a schema for this page */
-			tab = new LinkedList<TableDescriptor>();
-			tab.add(tdesc);
-			debug(" added tdsec ");
-		} else {
-			warning(" No component description!");
-			tab = tables;
-		}
-
-		LinkedList<Gap> gaps = findGaps();
-		if (gaps.size() == 0) {
-			debug("no gaps anymore. Stopp search");
-			return;
-		}
-
-		/* try out all component schema(s) */
-		for (int n = 0; n < tab.size(); n++) {
-			tdesc = tab.get(n);
-			debug("pagenumber :: ", pagenumber_maindb, " component size :: ", tab.size());
-			debug("n ", n);
-			// TableDescriptor tdb = tab.get(n);
-
-			/* access pattern for a particular component */
-			String tablename = tab.get(n).tblname;
-			debug("WALReader 713 Check component : ", tablename);
-			if (tablename.startsWith("__UNASSIGNED"))
-				continue;
-			/* create matcher object for constrain check */
-			SerialTypeMatcher stm = new SerialTypeMatcher(buffer);
-
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				if (next.to - next.from > 10)
-					/* do we have at least one match ? */
-					if (c.carve(next.from + 4, next.to, stm, CarverTypes.NORMAL, tab.get(n), firstcol) != Global.CARVING_ERROR) {
-						debug("*****************************  STEP NORMAL finished with matches");
-
-					}
-			}
-
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				if (c.carve(next.from + 4, next.to, stm, CarverTypes.COLUMNSONLY, tab.get(n), firstcol) != Global.CARVING_ERROR) {
-					debug("*****************************  STEP COLUMNSONLY finished with matches");
-
-				}
-			}
-
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				if (c.carve(next.from + 4, next.to, stm, CarverTypes.FIRSTCOLUMNMISSING, tab.get(n), firstcol) != Global.CARVING_ERROR) {
-					debug("*****************************  STEP FIRSTCOLUMNMISSING finished with matches");
-
-				}
-
-			}
-
-			/**
-			 * When a record deletion occurs, the first 2 bytes of the cell are set to the
-			 * offset value of next free block and latter 2 bytes covers the length of the
-			 * current free block. Because of this, the first 4 bytes of a deleted cell
-			 * differ startRegion the normal data. Accordingly, we need a different approach
-			 * to recover the data records.
-			 * 
-			 * In most cases, at least the header length information is overwritten. Boyond
-			 * this, sometimes, also the first column type field is overwritten too.
-			 * 
-			 * We have to cases:
-			 * 
-			 * (1) only the first column of the header is missing, but the rest of the
-			 * header is intact.
-			 * 
-			 * (2) both header length field plus first column are overwritten.
-			 * 
-			 * [cell size | rowid | header size | header bytes | payload ]
-			 * 
-			 * for a deleted cell is looks maybe like this
-			 * 
-			 * [offset of next free block | length of the current free block | ]
-			 */
-
-			/* There are still gaps? */
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				/* one last try with 4+1 instead of 4 Bytes */
-				c.carve(next.from + 4 + 1, next.to, stm, CarverTypes.FIRSTCOLUMNMISSING, tab.get(n), firstcol);
-
-			}
-
-		} // end of tables ( component fingerprint )
-
-		debug("End of WALReader:parse()");
-
-		
+		if (null != buffer)
+			this.buffer = buffer;
+		carve(crv);
 	}
 	
 	
@@ -940,14 +855,8 @@ public abstract class WALReaderBase extends Base {
 				if (to - from > 10) {
 
 					/* check for zero bytes */
-					boolean isNull = false;
-					if (buffer.get(from) == 0) {
-						isNull = true;
-						for (int index = from; index < to; index++) {
-							if (0 != buffer.get(index))
-								isNull = false;
-						}
-					}
+					/* only zeros behind a (possible) 4 byte freeblock header: nothing to recover */
+					boolean isNull = Auxiliary.isEmptyArea(buffer, from, to);
 					// skip NULL-Byte areas - mark as visited
 					if (isNull)
 						visit.set(from, to);
@@ -978,7 +887,11 @@ public abstract class WALReaderBase extends Base {
 			/* no type could be found in the first byte */
 			/* Maybe the whole page was drop because of a drop component command ? */
 			/* start carving on the complete page */
+		{
 			c = new Carver(job, buffer, visit, pagenumber_maindb);
+			c.source = RecordSource.WAL;
+			c.pageFileOffset = framestart + 24;
+		}
 
 		// Matcher mat = null;
 		// boolean match = false;

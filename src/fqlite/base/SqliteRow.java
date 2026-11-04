@@ -11,6 +11,30 @@ public class SqliteRow {
     private boolean deleted;
     private Map<String, Integer> colIdx = null;
     private Charset charset = StandardCharsets.UTF_8;
+    private RecordSource source = RecordSource.DATABASE;
+    private long offset = 0L;
+
+    /**
+     * @return the file this record was read from
+     */
+    public RecordSource getSource() {
+        return source;
+    }
+
+    void setSource(RecordSource source) {
+        this.source = source;
+    }
+
+    /**
+     * @return offset of the record inside the file it was read from (see {@link #getSource()})
+     */
+    public long getOffset() {
+        return offset;
+    }
+
+    void setOffset(long offset) {
+        this.offset = offset;
+    }
 
     void setColumnNamesMap(Map<String, Integer> colIdx) {
         this.colIdx = colIdx;
@@ -34,6 +58,20 @@ public class SqliteRow {
     
     public void setRowData(Object[] rowData) {
         this.rowData = rowData;
+    }
+
+    /* numeric values of the columns that were converted to a date string (or null) */
+    private Object[] rawData = null;
+
+    void setRawData(Object[] rawData) {
+        this.rawData = rawData;
+    }
+
+    private Object rawValue(int colIdx) {
+        if (rawData != null && colIdx >= 0 && colIdx < rawData.length) {
+            return rawData[colIdx];
+        }
+        return null;
     }
 
     
@@ -60,6 +98,7 @@ public class SqliteRow {
             } else {
                 builder.append(elementData.toString());
             }
+            semicolon = true;
         }        
         return builder.toString();
     }
@@ -69,6 +108,13 @@ public class SqliteRow {
         if (colIdx >= 0 && colIdx < rowData.length) {
             Object val = rowData[colIdx];
             if (val != null) {
+                if (val instanceof String) {
+                    /* a timestamp converted to a date string (Global.CONVERT_DATETIME) */
+                    Object raw = rawValue(colIdx);
+                    if (raw != null) {
+                        val = raw;
+                    }
+                }
                 if (val instanceof Long) {
                     result = (Long) val;
                 } else if (val instanceof Integer) {
@@ -119,6 +165,13 @@ public class SqliteRow {
         if (colIdx >= 0 && colIdx < rowData.length) {
             Object val = rowData[colIdx];
             if (val != null) {
+                if (val instanceof String) {
+                    /* a timestamp converted to a date string (Global.CONVERT_DATETIME) */
+                    Object raw = rawValue(colIdx);
+                    if (raw != null) {
+                        val = raw;
+                    }
+                }
                 if (val instanceof Double) {
                     result = (Double) val;
                 } else if (val instanceof Float) {

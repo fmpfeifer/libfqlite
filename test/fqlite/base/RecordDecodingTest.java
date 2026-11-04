@@ -1,0 +1,179 @@
+package fqlite.base;
+
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.util.List;
+import java.util.Random;
+
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+public class RecordDecodingTest {
+
+    @Rule
+    public TemporaryFolder tmp = new TemporaryFolder();
+
+    private Path dir() {
+        return tmp.getRoot().toPath();
+    }
+
+    private static SqliteRow single(Job job, String table) {
+        List<SqliteRow> rows = job.getRowsForTable(table);
+        assertEquals(1, rows.size());
+        return rows.get(0);
+    }
+
+    @Test
+    public void constantZeroAndOne() throws Exception {
+        Path db = TestSupport.createDb(dir(), "bool.db", c -> TestSupport.exec(c,
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)", "INSERT INTO t VALUES(5, 1, 0)"));
+        SqliteRow r = single(TestSupport.run(db), "t");
+        assertEquals(5, r.getIntValue("id"));
+        assertEquals(1, r.getIntValue("a"));
+        assertEquals(0, r.getIntValue("b"));
+    }
+
+    @Test
+    public void rowidAliasColumn() throws Exception {
+        Path db = TestSupport.createDb(dir(), "alias.db", c -> TestSupport.exec(c,
+                "CREATE TABLE t(name TEXT, id INTEGER PRIMARY KEY)", "INSERT INTO t VALUES(NULL, 42)",
+                "CREATE TABLE u(a TEXT, b TEXT)", "INSERT INTO u VALUES(NULL, 'x')"));
+        Job job = TestSupport.run(db);
+        SqliteRow t = single(job, "t");
+        assertNull(t.getTextValue("name"));
+        assertEquals(42, t.getIntValue("id"));
+        /* no INTEGER PRIMARY KEY: a NULL in the first column stays NULL */
+        SqliteRow u = single(job, "u");
+        assertNull(u.getTextValue("a"));
+        assertEquals("x", u.getTextValue("b"));
+    }
+
+    @Test
+    public void textSpanningSeveralOverflowPages() throws Exception {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 3000; i++) {
+            sb.append(i).append(',');
+        }
+        String big = sb.toString();
+        Path db = TestSupport.createDb(dir(), "ovf.db", c -> {
+            TestSupport.exec(c, "PRAGMA page_size=1024", "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT)");
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO t VALUES(1, ?, 'after')")) {
+                ps.setString(1, big);
+                ps.execute();
+            }
+        });
+        SqliteRow r = single(TestSupport.run(db), "t");
+        assertEquals(big, r.getTextValue("v"));
+        assertEquals("after", r.getTextValue("w"));
+    }
+
+    /** A cycle in the overflow chain must not lead to an endless loop. */
+    @Test(timeout = 30000)
+    public void cyclicOverflowChain() throws Exception {
+        byte[] blob = new byte[5000];
+        new Random(1).nextBytes(blob);
+        Path db = TestSupport.createDb(dir(), "cycle.db", c -> {
+            TestSupport.exec(c, "PRAGMA page_size=1024", "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)");
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO t VALUES(1, ?)")) {
+                ps.setBytes(1, blob);
+                ps.execute();
+            }
+        });
+        /* page 3 is the first overflow page: let it point to itself */
+        try (RandomAccessFile f = new RandomAccessFile(db.toFile(), "rw")) {
+            f.seek(2 * 1024);
+            f.writeInt(3);
+        }
+        Job job = TestSupport.run(db);
+        SqliteRow r = single(job, "t");
+        byte[] v = r.getBlobValue("v");
+        assertNotNull(v);
+        assertTrue(v.length < blob.length);
+    }
+
+    /** Records with more than 127 header bytes use a 2 byte varint for the header size. */
+    @Test
+    public void headerLongerThan127Bytes() throws Exception {
+        int n = 150;
+        StringBuilder create = new StringBuilder("CREATE TABLE t(id INTEGER PRIMARY KEY");
+        StringBuilder insert = new StringBuilder("INSERT INTO t VALUES(1");
+        for (int i = 0; i < n; i++) {
+            create.append(", c").append(i).append(" INTEGER");
+            insert.append(", ").append(i + 2);
+        }
+        Path db = TestSupport.createDb(dir(), "wide.db",
+                c -> TestSupport.exec(c, create.append(")").toString(), insert.append(")").toString()));
+        SqliteRow r = single(TestSupport.run(db), "t");
+        for (int i = 0; i < n; i++) {
+            assertEquals("c" + i, i + 2, r.getIntValue("c" + i));
+        }
+    }
+
+    /** Payloads of index pages (WITHOUT ROWID tables) spill earlier than table payloads. */
+    @Test
+    public void withoutRowidTableWithOverflow() throws Exception {
+        String key = TestSupport.repeat('k', 2000);
+        Path db = TestSupport.createDb(dir(), "wr.db", c -> {
+            TestSupport.exec(c, "CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO t VALUES(?, 'value')")) {
+                ps.setString(1, key);
+                ps.execute();
+            }
+        });
+        SqliteRow r = single(TestSupport.run(db), "t");
+        assertEquals(key, r.getTextValue("k"));
+        assertEquals("value", r.getTextValue("v"));
+    }
+
+    /** Pages with reserved space at the end have a smaller usable size. */
+    @Test
+    public void reservedSpace() throws Exception {
+        Path db = dir().resolve("reserved.db");
+        java.nio.file.Files.write(db, emptyDatabase(1024, 32));
+        byte[] blob = new byte[6000];
+        new Random(2).nextBytes(blob);
+        try (Connection c = TestSupport.open(db)) {
+            TestSupport.exec(c, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)");
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO t VALUES(1, ?)")) {
+                ps.setBytes(1, blob);
+                ps.execute();
+            }
+        }
+        SqliteRow r = single(TestSupport.run(db), "t");
+        assertArrayEquals(blob, r.getBlobValue("v"));
+        assertEquals(1, r.getIntValue("id"));
+    }
+
+    /** An empty database file (only page 1) with the given page size and reserved bytes per page. */
+    private static byte[] emptyDatabase(int pageSize, int reserved) {
+        ByteBuffer b = ByteBuffer.allocate(pageSize);
+        b.put("SQLite format 3\0".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        b.putShort((short) pageSize);
+        b.put((byte) 1).put((byte) 1).put((byte) reserved);
+        b.put((byte) 64).put((byte) 32).put((byte) 32);
+        b.putInt(1); // file change counter
+        b.putInt(1); // database size in pages
+        b.putInt(0).putInt(0); // freelist
+        b.putInt(0); // schema cookie
+        b.putInt(4); // schema format
+        b.putInt(0).putInt(0); // cache size, largest root page
+        b.putInt(1); // UTF-8
+        b.putInt(0).putInt(0).putInt(0); // user version, incremental vacuum, application id
+        b.position(92);
+        b.putInt(1); // version-valid-for (equals the change counter)
+        b.putInt(3045000);
+        /* empty table leaf page for sqlite_master */
+        b.put((byte) 0x0d).putShort((short) 0).putShort((short) 0).putShort((short) (pageSize - reserved)).put((byte) 0);
+        return b.array();
+    }
+}

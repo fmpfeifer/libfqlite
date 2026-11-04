@@ -75,7 +75,8 @@ public class SqliteElement {
 	                    return strDateTime;
 	                }
 	            }
-	            return String.format("%.8f", dValue);
+	            /* independent of the default locale of the machine (decimal point) */
+	            return String.format(java.util.Locale.ROOT, "%.8f", dValue);
 	        case BLOB:
 	            return String.valueOf(Auxiliary.bytesToHex(value));
 	        case PRIMARY_KEY:
@@ -101,6 +102,9 @@ public class SqliteElement {
 
 	final static int decodeInt24(byte[] v) {
 		int result = int24bytesToUInt(v);
+		/* 24-bit twos-complement integer -> extend the sign */
+		if (v.length >= 3)
+			result = (result << 8) >> 8;
 		return result;
 	}
 
@@ -135,10 +139,9 @@ public class SqliteElement {
 			converted[i + 2] = value[i];
 		}
 		ByteBuffer result = ByteBuffer.wrap(converted);
- 
-       // bf.order(ByteOrder.BIG_ENDIAN);
-			
-		return result.getLong();
+
+		/* 48-bit twos-complement integer -> extend the sign */
+		return (result.getLong() << 16) >> 16;
 	}
 
 	final static long decodeInt64(byte[] v) {
@@ -188,7 +191,7 @@ public class SqliteElement {
 			}
 		}
 
-		if (printable / value.length > threshold) {
+		if (value.length > 0 && (float) printable / value.length > threshold) {
 			return true;
 		}
 

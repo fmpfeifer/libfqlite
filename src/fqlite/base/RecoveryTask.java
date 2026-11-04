@@ -11,6 +11,7 @@ import fqlite.descriptor.TableDescriptor;
 import fqlite.pattern.SerialTypeMatcher;
 import fqlite.types.CarverTypes;
 import fqlite.util.Auxiliary;
+import fqlite.util.FreeblockReconstructor;
 
 /**
  * This class represents a recovery task. 
@@ -32,6 +33,10 @@ public class RecoveryTask extends Base implements Runnable {
 	private Auxiliary ct;
     private StringBuffer firstcol = new StringBuffer(); 
     private boolean freeList = false;
+    /* page which is not referenced by any b-tree of the database nor by the freelist */
+    private boolean unreferencedPage = false;
+    /* number of leaf page numbers, if the page is a freelist trunk page (-1 otherwise) */
+    private int trunkEntries = -1;
     
 	/**
 	 * Constructor method.
@@ -63,6 +68,28 @@ public class RecoveryTask extends Base implements Runnable {
 	}
 
 	/**
+	 * Mark the page as not referenced by any b-tree of the database nor by the freelist.
+	 * Records read from its cell pointer array are reported as
+	 * {@link Global#UNALLOCATED_SPACE} records.
+	 * 
+	 * @param unreferencedPage true, if the page is not referenced
+	 */
+	public void setUnreferencedPage(boolean unreferencedPage) {
+		this.unreferencedPage = unreferencedPage;
+	}
+
+	/**
+	 * Mark the page as freelist trunk page. Only its first bytes are used by the
+	 * freelist (next trunk page, number of leaf pages and the leaf page numbers),
+	 * the rest of the page still holds its former content, which is carved.
+	 * 
+	 * @param entries number of leaf page numbers stored on the trunk page
+	 */
+	public void setFreelistTrunk(int entries) {
+		this.trunkEntries = entries;
+	}
+
+	/**
 	 * This method called to recover regular data records startRegion a database page.
 	 * 
 	 * @return 0 if successful, -1 otherwise.
@@ -79,6 +106,13 @@ public class RecoveryTask extends Base implements Runnable {
 			buffer = job.readPageWithOffset(offset, pagesize);
 			if (buffer == null) {
 			    return -1;
+			}
+
+			if (trunkEntries >= 0) {
+				/* freelist trunk page: skip the freelist data, carve the former content */
+				visit.set(0, Math.min(pagesize, 8 + 4 * trunkEntries));
+				carve(null);
+				return 0;
 			}
 			byte pageType = buffer.get();
 
@@ -137,6 +171,10 @@ public class RecoveryTask extends Base implements Runnable {
 				info("Index leaf page ", pagenumber);	
 				// note: WITHOUT ROWID tables are saved here.
 				withoutROWID=true;
+			} else if (type == 2) {
+				/* interior pages of index b-trees hold records too (e.g. of WITHOUT ROWID tables) */
+				info("Index interior page ", pagenumber);
+				withoutROWID=true;
 			} else {
 				info("Data page ", pagenumber, " Offset: ", offset);
 
@@ -182,13 +220,20 @@ public class RecoveryTask extends Base implements Runnable {
 
 			ByteBuffer size = ByteBuffer.wrap(cpn);
 			int cp = Auxiliary.TwoByteBuffertoInt(size);
+			/* the cell pointer array can not be larger than the page (corrupted page) */
+			/* interior pages have a 12 byte header (with the right most child pointer) */
+			int pageheader = (type == 2) ? 12 : 8;
+			cp = Math.min(cp, (pagesize - pageheader) / 2);
+			/* a value of zero means 65536 */
+			if (ccrstart == 0)
+				ccrstart = 65536;
 
 			debug(" number of cells: ", cp, " type of page ",  type);
 			job.numberofcells.addAndGet(cp);
 			if (0 == cp)
 				debug(" Page seems to be dropped. No cell entries.");
 
-			int headerend = 8 + (cp * 2);
+			int headerend = pageheader + (cp * 2);
 			visit.set(0, headerend);
 			//System.out.println("headerend:" + headerend);
 
@@ -199,16 +244,15 @@ public class RecoveryTask extends Base implements Runnable {
 			 * 
 			 ***************************************************************/
 			int last = 0;
+			/* text lengths of the live records (to reconstruct deleted records of the freeblocks) */
+			java.util.Map<Integer, java.util.Map<Integer, Integer>> textLengths = new java.util.HashMap<>();
 
 			/* go on with the cell pointer array */
 			for (int i = 0; i < cp; i++) {
 
 				// address of the next cell pointer
 				byte pointer[] = new byte[2];
-				if (type == 5)
-					buffer.position(12+2*i);
-				else
-					buffer.position(8+2*i);
+				buffer.position(pageheader + 2 * i);
 				buffer.get(pointer);
 				ByteBuffer celladdr = ByteBuffer.wrap(pointer);
 				int celloff = Auxiliary.TwoByteBuffertoInt(celladdr);
@@ -222,83 +266,27 @@ public class RecoveryTask extends Base implements Runnable {
 					
 				SqliteInternalRow row = null;
 				
-				if (celloff < buffer.limit() - 20) {
-				    row = ct.readRecord(celloff, buffer, pagenumber, visit, type, Integer.MAX_VALUE, firstcol,withoutROWID,-1);
+				/* small cells can be located in the very last bytes of the page */
+				/* cells of interior index pages start with the 4 byte page number of the left child */
+				int recordstart = (type == 2) ? celloff + 4 : celloff;
+				if (celloff > 0 && recordstart < buffer.limit()) {
+				    try {
+				        if (type == 2)
+				            visit.set(celloff, recordstart);
+				        row = ct.readRecord(recordstart, buffer, pagenumber, visit, type, Integer.MAX_VALUE, firstcol,withoutROWID,-1);
+				    } catch (RuntimeException e) {
+				        /* corrupted cell - skip it */
+				        debug("Could not read cell at offset ", celloff, " of page ", pagenumber, ": ", e);
+				        row = null;
+				    }
 				}
 								
 				// add new line to output
 				if (null != row) {
 					
-					int p;
-					String tableName = row.getTableName();
-					if ((p = tableName.indexOf("_node;")) > 0)
-					{
-						String tbln = tableName.substring(0, p);
-						
-						if (job.virtualTables.containsKey(tbln))
-						{
-							TableDescriptor tds = job.virtualTables.get(tbln);
-							
-							/* we use the xxx_node shadow component to construct the 
-							 * virtual component
-							 */
-							//String BLOB = tableName.substring(p);
-							//System.out.println(BLOB);
-							
-							/* skip the first information -> go directly to the 5th element
-							 * of the data record line, i.e. go to the BLOB with the row data
-							 */
-							//int pp = Auxiliary.findNthOccur(rc, ';', 4);
-							//String data = rc.substring(pp+1);
-
-							String data = row.getRowData().get(1).toString();
-						
-							/* transform String data into an byte array */
-							byte[] binary = Auxiliary.decode(data);
-							ByteBuffer bf = ByteBuffer.wrap(binary);
-                            
-							/* skip the first to bytes */
-							bf.getShort();
-							/* first get the total number of entries for this rtree branch */
-                            int entries = bf.getShort();
-					
-                            /* create a new line for every data row */ 
-                            while(entries>0)
-                            {
-                                SqliteInternalRow vrow = new SqliteInternalRow();
-                                vrow.setTableName(tbln);
-                                vrow.setRecordType("VT");
-                                vrow.setOffset(0);
-    					
-                            	// The first column is always a 64-bit signed integer primary key.
-                            	long primarykey = bf.getLong();
-                                vrow.append(new SqliteElementData(primarykey, job.db_encoding));
-                            	
-                            	//Each R*Tree indices is a virtual component with an odd number of columns between 3 and 11
-                            	//The other columns are pairs, one pair per dimension, containing the minimum and maximum values for that dimension, respectively.
-                            	int number = tds.columnnames.size() - 1;
-                            	
-                            	while (number > 0)
-                            	{	
-	                            	float rv = bf.getFloat();
-	                                vrow.append(new SqliteElementData(rv, job.db_encoding));
-	                            	number--;
-                            	}
-
-
-	                            //vrow.append("\n");
-                                //job.ll.add(vrow.toString());
-                                job.addRow(vrow);
-
-    							info(vrow.toString());
-
-    							entries--;
-
-                            }	
-
-
-						}
-
+					/* R*Tree virtual table: decode the entries of the shadow node table */
+					for (SqliteInternalRow vrow : RTreeDecoder.decode(job, row)) {
+					    job.addRow(vrow);
 					}
 					
 					/* if record resides inside a free page -> add a flag char to document this */
@@ -307,10 +295,33 @@ public class RecoveryTask extends Base implements Runnable {
 					   row.setRecordType(Global.FREELIST_ENTRY + row.getRecordType());
 					   
 					}
+					else if (unreferencedPage)
+					{
+					   /* not reachable from the database structure (e.g. lost schema entry) */
+					   row.setRecordType(Global.UNALLOCATED_SPACE + row.getRecordType());
+					}
+					if (!freeList && !unreferencedPage)
+						FreeblockReconstructor.addTextLengths(textLengths, row);
 					job.addRow(row);
 				}
 
 			} // end of for - cell pointer
+
+			/***************************************************************
+			 * Deleted records in the freeblocks: reconstructed with the exact
+			 * bounds of the freeblocks and the schema of the table
+			 ***************************************************************/
+			if (type == 8 || type == 10) {
+				AbstractDescriptor ad = (pagenumber < job.pages.length) ? job.pages[pagenumber] : null;
+				if (ad instanceof TableDescriptor && (type == 8) == ad.ROWID) {
+					try {
+						FreeblockReconstructor.recoverFreeblocks(ct, buffer, (TableDescriptor) ad, type == 10, textLengths,
+								visit, (long) (pagenumber - 1) * job.ps, RecordSource.DATABASE, job::addRow);
+					} catch (RuntimeException e) {
+						debug("Could not reconstruct the freeblocks of page ", pagenumber, ": ", e);
+					}
+				}
+			}
 
 			
 			/***************************************************************
@@ -332,22 +343,26 @@ public class RecoveryTask extends Base implements Runnable {
 			 *  artifacts in the unallocated space. 
 			 */
 			
+			/* the unallocated area ends where the cell content area starts - never read into the cells */
+			int unallocatedEnd = Math.min(ccrstart, pagesize);
+
 			byte garbage[] = new byte[2];
 			
 			int garbageoffset = -1;
 			do
 			{
-				
+				if (buffer.remaining() < 2 || buffer.position() + 2 > unallocatedEnd)
+					break;
 				buffer.get(garbage);
 				ByteBuffer ignore = ByteBuffer.wrap(garbage);
 				garbageoffset = Auxiliary.TwoByteBuffertoInt(ignore);
 				//System.out.println("garbage bytes " + buffer.position());
-			} while (buffer.position() < pagesize && garbageoffset > 0);
+			} while (buffer.position() < unallocatedEnd && garbageoffset > 0);
 			
 			
 			/*  Now, skip all zeros - no information to recover just empty space */
 			byte zerob = 0;
-			while(buffer.position() < pagesize && zerob == 0)
+			while (buffer.position() < unallocatedEnd && zerob == 0)
 			{
 				zerob = buffer.get();
 			}
@@ -371,7 +386,12 @@ public class RecoveryTask extends Base implements Runnable {
 				
 				/* Tricky thing : data record could be partly overwritten with a new data record!!!  */
 				/* We should read until the end of the unallocated area and not above! */
-				row = ct.readRecord(buffer.position(), buffer, pagenumber, visit, type, ccrstart - buffer.position(),firstcol,withoutROWID,-1);
+				try {
+					row = ct.readRecord(buffer.position(), buffer, pagenumber, visit, type, ccrstart - buffer.position(),firstcol,withoutROWID,-1);
+				} catch (RuntimeException e) {
+					debug("Could not read record in unallocated space of page ", pagenumber, ": ", e);
+					row = null;
+				}
 				
 				// add new line to output
 				if (null != row) { // && rc.length() > 0) {
@@ -447,14 +467,8 @@ public class RecoveryTask extends Base implements Runnable {
 				if (to - from >= 4) {
 
 					/* check for zero bytes */
-					boolean isNull = false;
-					if (buffer.get(from) == 0) {
-						isNull = true;
-						for (int index = from; index < to; index++) {
-							if (0 != buffer.get(index))
-								isNull = false;
-						}
-					}
+					/* only zeros behind a (possible) 4 byte freeblock header: nothing to recover */
+					boolean isNull = Auxiliary.isEmptyArea(buffer, from, to);
 					// skip NULL-Byte areas - mark as visited
 					if (isNull)
 						visit.set(from, to);

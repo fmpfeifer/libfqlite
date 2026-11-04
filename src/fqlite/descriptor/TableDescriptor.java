@@ -34,7 +34,7 @@ public class TableDescriptor extends AbstractDescriptor implements Comparable<Ta
 	String signature = ""; // the type signature, i.e., INTSTRINGSTINGINT
 	public String tblname = "";
 	public int root = -1;
-	public boolean ROWID = true; 
+	/* ROWID: inherited from AbstractDescriptor (a field here would hide it) */
     private HeaderPattern hpattern = null;	
 	public boolean virtual = false;
 	public String modulname = null;
@@ -183,13 +183,11 @@ public class TableDescriptor extends AbstractDescriptor implements Comparable<Ta
 		/* find the primary key by checking the column constraint */ 
 		for(int i=0; i < names.size(); i++)
 		{
-			if (null != constraints)
-				info("tblname: " + tblname);
-			
 			if (tblname.equals("__UNASSIGNED"))
 				break;
-				/* we look for the keyword PRIMARYKEY */
-				if (constraints.get(i).contains("PRIMARYKEY"))
+				/* we look for the keyword PRIMARYKEY (virtual tables have no constraints) */
+				if (null != constraints && i < constraints.size() && null != constraints.get(i)
+						&& constraints.get(i).contains("PRIMARYKEY"))
 				{
 					this.primarykeycolumns.add(names.get(i));
 				}

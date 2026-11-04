@@ -196,7 +196,7 @@ public class PageReader extends Base {
 
 		boolean error = false;
 
-		row.setOffset((pagenumber - 1) * job.ps + buffer.position());
+		row.setOffset((long) (pagenumber - 1) * job.ps + buffer.position());
 
 		/* use the header information to reconstruct */
 		int pll = Auxiliary.computePayloadLengthS(header);
