@@ -104,13 +104,7 @@ public abstract class RollbackJournalReaderBase extends Base {
 	public void parse() throws IOException {
 		Path p = Paths.get(path);
 
-		
-		/*
-		 * we have to do this before we open the database because of the concurrent
-		 * access
-		 */
-
-		/* try to open the db-file in read-only mode */
+		/* try to open the journal file in read-only mode */
 		try {
 			file = new RandomAccessFileReader(p);
 		} catch (Exception e) {
@@ -118,133 +112,175 @@ public abstract class RollbackJournalReaderBase extends Base {
 			return;
 		}
 
+		try {
+			parseJournal();
+		} finally {
+			file.close();
+		}
+	}
+
+	private static boolean isPowerOfTwo(long v, long min, long max) {
+		return v >= min && v <= max && (v & (v - 1)) == 0;
+	}
+
+	private boolean isJournalHeader(long position) throws IOException {
+		if (position + 8 > file.size())
+			return false;
+		ByteBuffer b = file.allocateAndReadBuffer(position, 8);
+		return b != null && Auxiliary.bytesToHex(b.array()).equals(MAGIC_HEADER_STRING);
+	}
+
+	/**
+	 * A rollback journal consists of one or more segments. Each segment starts with a
+	 * header (padded to the sector size) followed by page records:
+	 *
+	 * 4 bytes page number | page content | 4 bytes checksum
+	 *
+	 * Journal header format:
+	 *
+	 * 0	8	Header string:  0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7
+	 * 8	4	The "Page Count" - The number of pages in the next segment of the journal, or -1 to mean all content to the end of the file
+	 * 12	4	A random nonce for the checksum
+	 * 16	4	Initial size of the database in pages
+	 * 20	4	Size of a disk sector assumed by the process that wrote this journal.
+	 * 24	4	Size of pages in this journal.
+	 *
+	 * Source: https://www.sqlite.org/fileformat.html#the_rollback_journal
+	 */
+	private void parseJournal() throws IOException {
+
 		if(file.size() <= 512)
 		{
 			info("RollbackJournal-File is empty. Skip analyzing.");
-				return;
+			return;
 		}
 
+		if (ps <= 0)
+			ps = job.ps;
 
-
-		/*
-		 * In practice when a transaction is committed it seems that the journal 
-		 * header is normally zeroed and the data in the journal remains. 
-		 * This is not a problem when it comes to reading each page from 
-		 * the journal as we can obtain the page size from the database itself.
-		 */
-
-		/*******************************************************************/
-
-		
-		/*
-		 * A valid rollback journal begins with a header in the following format:
-		 * 
-		 * Offset	Size	Description
-		 * 0 		8 		Header string: 0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7
-		 * 8	 	4 		The "Page Count" - The number of pages in the next segment of the journal, or -1 to mean all content to the end of the file
-		 * 12	 	4 		A random nonce for the checksum
-		 * 16	 	4 		Initial size of the database in pages
-		 * 20 		4 		Size of a disk sector assumed by the process that wrote this journal.
-		 * 24 		4 		Size of pages in this journal. 
-		 */
-		
-		/* read header of the WAL file - the first 28 bytes */
-		ByteBuffer header = file.allocateAndReadBuffer(0, 28);
-
-		byte head[] = new byte[8];
-		header.get(head);
-		
-
-		if (Auxiliary.bytesToHex(head).equals(MAGIC_HEADER_STRING))
-		{
-			info("header is okay. seems to be an rollback journal file.");
-		}
-		else 
-		{
-				info("sorry. doesn't seem to be an rollback journal file. Wrong header.");
-				err("Doesn't seem to be an valid rollback journal file. Wrong header.");
-			
-		}
-		
-		pagecount = Integer.toUnsignedLong(header.getInt());
-		info(" pagecount ", pagecount);
-
-		nounce = Integer.toUnsignedLong(header.getInt());
-		info(" nounce ", nounce);
-
-		pages = Integer.toUnsignedLong(header.getInt());
-		info(" pages ", pages);
-		
-		sectorsize = Integer.toUnsignedLong(header.getInt());
-		info(" sector size  ", sectorsize);
-		
-		journalpagesize = Integer.toUnsignedLong(header.getInt());
-		info(" journal page size  ", journalpagesize);
-
-		
-	    journalpointer = 512; // this is the position, where the first frame should be
-
-
-		/* initialize the BitSet for already visited location within */
-
-		visit = new BitSet(ps);
-
-		
-		
-		boolean next = false;
+		long segment = 0;
+		long sector = 512;
+		boolean firstSegment = true;
 		int numberofpages = 0;
-		do
-		{
-			file.position(journalpointer);
-			/* get the page number of the journal page in main db */
-			
-		    pagenumber_maindb = file.allocateAndReadBuffer(4).getInt();
-			debug("pagenumber of journal-entry ", pagenumber_maindb);
-			
-	
-			/* now we can read the page - it follows immediately after the frame header */
-	
-			/* read the db page into buffer */
-			buffer = readPage();
-	
-			numberofpages++;
-			pagenumber_rol = numberofpages;
-			
-			analyzePage();
-			
-			/* set pointer to next journal record  -> currentpos + 4 Byte for the page number in mainDB + pagesize + 4 Byte for Checksum */ 
-			journalpointer += (4 + ps + 4);
-			
-			//System.out.println(" Position in RollbackJournal-file " + journalpointer + " " );
-			
-			/*  More pages to analyze ? */
-			if(journalpointer + ps  <= file.size())
-			{
-				next = true;
+
+		while (segment + 28 <= file.size()) {
+
+			ByteBuffer header = file.allocateAndReadBuffer(segment, 28);
+			if (header == null)
+				break;
+
+			byte head[] = new byte[8];
+			header.get(head);
+			boolean valid = Auxiliary.bytesToHex(head).equals(MAGIC_HEADER_STRING);
+
+			if (valid) {
+				info("header is okay. seems to be an rollback journal file.");
+			} else if (firstSegment) {
+				/* the header may have been zeroed (journal_mode=PERSIST) - the page records can still be there */
+				info("sorry. doesn't seem to be an rollback journal file. Wrong header.");
+				warning("Doesn't seem to be an valid rollback journal file. Wrong header. Trying default values.");
+			} else {
+				break;
 			}
-			else
-				next = false;
-			
-		}while(next);
+
+			pagecount = Integer.toUnsignedLong(header.getInt());
+			info(" pagecount ", pagecount);
+			nounce = Integer.toUnsignedLong(header.getInt());
+			info(" nounce ", nounce);
+			pages = Integer.toUnsignedLong(header.getInt());
+			info(" pages ", pages);
+			sectorsize = Integer.toUnsignedLong(header.getInt());
+			info(" sector size  ", sectorsize);
+			journalpagesize = Integer.toUnsignedLong(header.getInt());
+			info(" journal page size  ", journalpagesize);
+
+			/* number of page records in this segment, -1 means: up to the end of the file */
+			long count = -1;
+			if (valid) {
+				if (isPowerOfTwo(sectorsize, 32, 65536))
+					sector = sectorsize;
+				if (isPowerOfTwo(journalpagesize, 512, 65536))
+					ps = (int) journalpagesize;
+				if (pagecount != 0xFFFFFFFFL && pagecount != 0)
+					count = pagecount;
+			}
+			firstSegment = false;
+
+			/* the first page record follows the header, which is padded to the sector size */
+			long pointer = segment + sector;
+			long nextSegment = -1;
+			long n = 0;
+
+			while ((count < 0 || n < count) && pointer + 4 + ps <= file.size()) {
+
+				if (count < 0 && n > 0) {
+					/* is there a new segment? Headers are aligned to the sector size */
+					long aligned = ((pointer + sector - 1) / sector) * sector;
+					if (isJournalHeader(aligned)) {
+						nextSegment = aligned;
+						break;
+					}
+				}
+
+				journalpointer = (int) pointer;
+
+				/* get the page number of the journal page in main db */
+				ByteBuffer pn = file.allocateAndReadBuffer(pointer, 4);
+				if (pn == null)
+					break;
+				pagenumber_maindb = pn.getInt();
+				debug("pagenumber of journal-entry ", pagenumber_maindb);
+
+				/* now we can read the page - it follows immediately after the page number */
+				buffer = readPage();
+				if (buffer == null)
+					break;
+
+				numberofpages++;
+				pagenumber_rol = numberofpages;
+
+				try {
+					analyzePage();
+				} catch (RuntimeException e) {
+					/* corrupted page - go on with the next one */
+					err("Error while analyzing journal page ", pagenumber_rol, ": ", e);
+				}
+
+				/* currentpos + 4 Byte for the page number in mainDB + pagesize + 4 Byte for Checksum */
+				pointer += 4 + ps + 4;
+				n++;
+			}
+
+			if (nextSegment < 0) {
+				if (count < 0)
+					break;
+				/* the next segment header starts at the next sector boundary */
+				nextSegment = ((pointer + sector - 1) / sector) * sector;
+			}
+			if (nextSegment <= segment)
+				break;
+			segment = nextSegment;
+		}
 
 		info("Lines after RollbackJournal-file recovery: ", output.size());
 		info("Number of pages in RollbackJournal-file", numberofpages);
-	
 	}
 
 	/**
 	 * Analyze the actual database page and try to recover regular and deleted content.
-	 * 
+	 *
 	 * @return int success
 	 */
 	public int analyzePage() {
 
 		withoutROWID = false;
-		
-		byte pageType = buffer.get();
-		buffer.get(pageType);
 
-		// offset 0
+		/* every journal record holds a different page -> start with a clean state */
+		visit = new BitSet(ps);
+		firstcol.setLength(0);
+
+		buffer.position(0);
+		byte pageType = buffer.get();
 		buffer.position(0);
 
 		/* check type of the page by reading the first byte */
@@ -253,43 +289,21 @@ public abstract class RollbackJournalReaderBase extends Base {
 		/* mark bytes as visited */
 		visit.set(0, 2);
 
-		/*
-		 * Tricky thing, since a zero page type has normally two possible reasons:
-		 * 
-		 * reason 1:
-		 * 
-		 * It is a dropped page. We have to carve for deleted cells but without cell
-		 * pointers, cause this list is dropped too or is damaged.
-		 * 
-		 * reason 2:
-		 * 
-		 * It is an overflow page -> skip it!
-		 */
 		if (type == 0) {
-
 			/*
 			 * if page was dropped - because of a DROP TABLE command - first 8 Bytes are
-			 * zero-bytes
+			 * zero-bytes, otherwise it seems to be an overflow page
 			 */
 			buffer.position(0);
-			Integer checksum = buffer.getInt();
-			/* was page dropped ? */
+			int checksum = buffer.getInt();
 			if (checksum == 0) {
 				info(" DROPPED PAGE !!!");
 				/* no overflow page -> carve for data records - we do our best! ;-) */
 				carve(null);
 			}
-			/*
-			 * otherwise it seems to be a overflow page - however, that is not 100% save !!!
-			 */
-
-			/* we have to leave in any case */
 			return 0;
 		}
 
-		/************** skip unkown page types ******************/
-
-		// no leaf page -> skip this page
 		if (type < 0) {
 			info("No Data page. ", pagenumber_rol);
 			return -1;
@@ -298,110 +312,127 @@ public abstract class RollbackJournalReaderBase extends Base {
 			return -1;
 		} else if (type == 10) {
 			info("Index leaf page ", pagenumber_rol);
+			// note: WITHOUT ROWID tables are saved here.
 			withoutROWID = true;
-
 		} else {
-			info("Data page ", pagenumber_rol, " Offset: ", (file.position() - ps));
+			info("Data page ", pagenumber_rol, " Offset: ", (journalpointer + 4));
 		}
 
-		/************** regular leaf page with data ******************/
-
-		// boolean freeblocks = false;
-		if (type == 8) {
-			// offset 1-2 let us find the first free block offset for carving
-			byte fboffset[] = new byte[2];
-			buffer.position(1);
-			buffer.get(fboffset);
-
-		}
-
-		
-
-		// found Data-Page - determine number of cell pointers at offset 3-4 of this
-		// page
+		/* number of cell pointers at offset 3-4 of this page */
 		byte cpn[] = new byte[2];
 		buffer.position(3);
 		buffer.get(cpn);
 
-		// get start pointer for the cell content region
+		/* start of the cell content region */
 		byte ccr[] = new byte[2];
 		buffer.position(5);
 		buffer.get(ccr);
-
-		ByteBuffer contentregionstart = ByteBuffer.wrap(ccr);
-		Auxiliary.TwoByteBuffertoInt(contentregionstart);
+		int ccrstart = Auxiliary.TwoByteBuffertoInt(ccr);
+		/* a value of zero means 65536 */
+		if (ccrstart == 0)
+			ccrstart = 65536;
 
 		/* mark as visited */
 		visit.set(2, 8);
 
-		ByteBuffer size = ByteBuffer.wrap(cpn);
-		int cp = Auxiliary.TwoByteBuffertoInt(size);
-
+		int cp = Auxiliary.TwoByteBuffertoInt(cpn);
+		/* the cell pointer array can not be larger than the page (corrupted page) */
+		cp = Math.min(cp, (ps - 8) / 2);
 		debug(" number of cells: ", cp, " type of page ", type);
 		job.numberofcells.addAndGet(cp);
-		if (0 == cp)
-			debug(" Page seems to be dropped. No cell entries.");
 
 		int headerend = 8 + (cp * 2);
 		visit.set(0, headerend);
-		//System.out.println("headerend:" + headerend);
 
 		/***************************************************************
-		 * STEP 2:
-		 * 
-		 * Cell pointer array scan (if possible)
-		 * 
+		 * STEP 2: Cell pointer array scan
 		 ***************************************************************/
 		int last = 0;
-
-		/* go on with the cell pointer array */
 		for (int i = 0; i < cp; i++) {
 
-			// address of the next cell pointer
 			byte pointer[] = new byte[2];
-			if (type == 5)
-				buffer.position(12 + 2 * i);
-			else
-				buffer.position(8 + 2 * i);
+			buffer.position(8 + 2 * i);
 			buffer.get(pointer);
-			ByteBuffer celladdr = ByteBuffer.wrap(pointer);
-			int celloff = Auxiliary.TwoByteBuffertoInt(celladdr);
+			int celloff = Auxiliary.TwoByteBuffertoInt(pointer);
 
-			if (last > 0) {
-				if (celloff == last) {
-					continue;
-				}
+			if (last > 0 && celloff == last) {
+				continue;
 			}
 			last = celloff;
-			
-			SqliteInternalRow row = null;
 
-			try {
-				row = ct.readRecord(celloff, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID, journalpointer + 4);
-			} catch (IOException e) {
-				e.printStackTrace();
+			SqliteInternalRow row = null;
+			if (celloff > 0 && celloff < buffer.limit()) {
+				try {
+					row = ct.readRecord(celloff, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID, journalpointer + 4);
+				} catch (IOException | RuntimeException e) {
+					debug("Could not read cell at offset ", celloff, " of journal page ", pagenumber_rol, ": ", e);
+				}
 			}
 
-			// add new line to output
 			if (null != row) {
+				row.setSource(RecordSource.ROLLBACK_JOURNAL);
 
 				/* R*Tree virtual table: decode the entries of the shadow node table */
 				for (SqliteInternalRow vrow : RTreeDecoder.decode(job, row)) {
-				    output.add(vrow);
-				    job.addRow(vrow);
+					output.add(vrow);
+					job.addRow(vrow);
 				}
 
 				output.add(row);
+				/* make the record available through the Job API too */
+				job.addRow(row);
 			}
+		}
 
-		} // end of for - cell pointer
-
-		
 		debug("finished STEP2 -> cellpoint array completed");
 
-		
-		return 0;
+		/***************************************************************
+		 * STEP 3: Scan unallocated space between header and the cell content region
+		 ***************************************************************/
+		try {
+			buffer.position(Math.min(headerend, buffer.limit()));
 
+			/* skip pointers of deleted records behind the official cell pointer array */
+			byte garbage[] = new byte[2];
+			int garbageoffset;
+			do {
+				if (buffer.remaining() < 2)
+					break;
+				buffer.get(garbage);
+				garbageoffset = Auxiliary.TwoByteBuffertoInt(garbage);
+			} while (buffer.position() < ps && garbageoffset > 0);
+
+			/* skip all zeros - no information to recover just empty space */
+			byte zerob = 0;
+			while (buffer.position() < ps && zerob == 0) {
+				zerob = buffer.get();
+			}
+			visit.set(headerend, buffer.position());
+			if (buffer.position() > 0)
+				buffer.position(buffer.position() - 1);
+
+			if (ccrstart - buffer.position() > 3) {
+				SqliteInternalRow row = ct.readRecord(buffer.position(), buffer, pagenumber_maindb, visit, type,
+						ccrstart - buffer.position(), firstcol, withoutROWID, journalpointer + 4);
+				if (null != row) {
+					row.setRecordType(Global.DELETED_RECORD_IN_PAGE + row.getRecordType());
+					row.setSource(RecordSource.ROLLBACK_JOURNAL);
+					output.add(row);
+					job.addRow(row);
+				}
+			}
+
+			/***************************************************************
+			 * STEP 4: carve the rest of the page
+			 ***************************************************************/
+			carve(null);
+
+		} catch (IOException | RuntimeException err) {
+			err("Error while carving journal page ", pagenumber_rol, ": ", err);
+			return -1;
+		}
+
+		return 0;
 	}
 
 	/**
@@ -432,7 +463,8 @@ public abstract class RollbackJournalReaderBase extends Base {
 	 * @throws IOException if an error occurs
 	 */
 	protected ByteBuffer readPage() throws IOException {
-		return file.allocateAndReadBuffer(ps);
+		/* the page follows the 4 byte page number of the journal record */
+		return file.allocateAndReadBuffer(journalpointer + 4L, ps);
 	}
 
 	/**
@@ -442,139 +474,11 @@ public abstract class RollbackJournalReaderBase extends Base {
 	 * @param crv Carver object
 	 */
 	public void carve(ByteBuffer buffer, Carver crv) {
-
-		Carver c = crv;
-
-		if (null == c)
-			/* no type could be found in the first byte */
-			/* Maybe the whole page was drop because of a drop component command ? */
-			/* start carving on the complete page */
-			c = new Carver(job, buffer, visit, ps);
-
-		// Matcher mat = null;
-		// boolean match = false;
-
-		/* try to get component schema for the current page, if possible */
-		TableDescriptor tdesc = null;
-		if (job.pages.length > ps) {
-			AbstractDescriptor ad = job.pages[ps];
-			if (ad instanceof TableDescriptor)
-				tdesc = (TableDescriptor) ad;
-		}
-
-		List<TableDescriptor> tab = tables;
-		debug(" tables :: ", tables.size());
-
-		if (null != tdesc) {
-			/* there is a schema for this page */
-			tab = new LinkedList<TableDescriptor>();
-			tab.add(tdesc);
-			debug(" added tdsec ");
-		} else {
-			warning(" No component description!");
-			tab = tables;
-		}
-
-		LinkedList<Gap> gaps = findGaps();
-		if (gaps.size() == 0) {
-			debug("no gaps anymore. Stopp search");
-			return;
-		}
-
-		/* try out all component schema(s) */
-		for (int n = 0; n < tab.size(); n++) {
-			tdesc = tab.get(n);
-			debug("pagenumber :: ", pagenumber_maindb, " component size :: ", tab.size());
-			debug("n ", n);
-			// TableDescriptor tdb = tab.get(n);
-
-			/* access pattern for a particular component */
-			String tablename = tab.get(n).tblname;
-			if (tablename.startsWith("__UNASSIGNED"))
-				continue;
-			/* create matcher object for constrain check */
-			SerialTypeMatcher stm = new SerialTypeMatcher(buffer);
-
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				if (next.to - next.from > 10)
-					/* do we have at least one match ? */
-					if (c.carve(next.from + 4, next.to, stm, CarverTypes.NORMAL, tab.get(n), firstcol) != Global.CARVING_ERROR) {
-						debug("*****************************  STEP NORMAL finished with matches");
-
-					}
-			}
-
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				if (c.carve(next.from + 4, next.to, stm, CarverTypes.COLUMNSONLY, tab.get(n), firstcol) != Global.CARVING_ERROR) {
-					debug("*****************************  STEP COLUMNSONLY finished with matches");
-
-				}
-			}
-
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				if (c.carve(next.from + 4, next.to, stm, CarverTypes.FIRSTCOLUMNMISSING, tab.get(n), firstcol) != Global.CARVING_ERROR) {
-					debug("*****************************  STEP FIRSTCOLUMNMISSING finished with matches");
-
-				}
-
-			}
-
-			/**
-			 * When a record deletion occurs, the first 2 bytes of the cell are set to the
-			 * offset value of next free block and latter 2 bytes covers the length of the
-			 * current free block. Because of this, the first 4 bytes of a deleted cell
-			 * differ startRegion the normal data. Accordingly, we need a different approach
-			 * to recover the data records.
-			 * 
-			 * In most cases, at least the header length information is overwritten. Boyond
-			 * this, sometimes, also the first column type field is overwritten too.
-			 * 
-			 * We have to cases:
-			 * 
-			 * (1) only the first column of the header is missing, but the rest of the
-			 * header is intact.
-			 * 
-			 * (2) both header length field plus first column are overwritten.
-			 * 
-			 * [cell size | rowid | header size | header bytes | payload ]
-			 * 
-			 * for a deleted cell is looks maybe like this
-			 * 
-			 * [offset of next free block | length of the current free block | ]
-			 */
-
-			/* There are still gaps? */
-			gaps = findGaps();
-
-			for (int a = 0; a < gaps.size(); a++) {
-
-				Gap next = gaps.get(a);
-
-				/* one last try with 4+1 instead of 4 Bytes */
-				c.carve(next.from + 4 + 1, next.to, stm, CarverTypes.FIRSTCOLUMNMISSING, tab.get(n), firstcol);
-
-			}
-
-		} // end of tables ( component fingerprint )
-
-		debug("End of journal parse");
-		
+		if (null != buffer)
+			this.buffer = buffer;
+		carve(crv);
 	}
+
 	
 	/**
 	 *  This method can be used to write the result to a file or
@@ -645,7 +549,11 @@ public abstract class RollbackJournalReaderBase extends Base {
 			/* no type could be found in the first byte */
 			/* Maybe the whole page was drop because of a drop component command ? */
 			/* start carving on the complete page */
+		{
 			c = new Carver(job, buffer, visit, pagenumber_maindb);
+			c.source = RecordSource.ROLLBACK_JOURNAL;
+			c.pageFileOffset = journalpointer + 4L;
+		}
 
 		// Matcher mat = null;
 		// boolean match = false;
