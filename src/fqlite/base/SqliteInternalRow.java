@@ -13,6 +13,7 @@ public class SqliteInternalRow {
     private String recordType = "";
     private String lineSuffix = "";
     private RecordSource source = RecordSource.DATABASE;
+    private long rowid = Long.MIN_VALUE;
     private Map<String, Integer> colIdx = null;
 
     void setColumnNamesMap(Map<String, Integer> colIdx) {
@@ -74,6 +75,18 @@ public class SqliteInternalRow {
     /**
      * @return the file this record was read from
      */
+    /**
+     * @return the rowid read from the cell, Long.MIN_VALUE if unknown (WITHOUT ROWID tables,
+     *         indices and carved records)
+     */
+    public long getRowId() {
+        return rowid;
+    }
+
+    public void setRowId(long rowid) {
+        this.rowid = rowid;
+    }
+
     public RecordSource getSource() {
         return source;
     }

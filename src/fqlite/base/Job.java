@@ -741,6 +741,15 @@ public class Job extends Base {
 			headers.put(tdefault.getName(), tdefault);
 			
 			unassignedTableCreated(tdefault);
+
+			/*
+			 * With a WAL or rollback journal file, the records are collected first: the
+			 * current version of each page is only known after reading these files
+			 */
+			if ((readWAL && isNonEmptyFile(walpath != null ? walpath : path + "-wal", 32))
+					|| (readRollbackJournal && isNonEmptyFile(rollbackjournalpath != null ? rollbackjournalpath : path + "-journal", 512))) {
+				collectedRows = new ConcurrentLinkedQueue<>();
+			}
 			/*******************************************************************/
 
 			byte freepageno[] = new byte[4];
@@ -911,6 +920,8 @@ public class Job extends Base {
 	            wal.parse();
 	        }
 			
+			resolvePageVersions();
+
 			linesReady();
 
 		} finally {
@@ -1446,7 +1457,105 @@ public class Job extends Base {
 
     }
 
+    /* records collected until the versions of the pages are resolved (null: add immediately) */
+    private volatile Queue<SqliteInternalRow> collectedRows = null;
+
+    private static boolean isNonEmptyFile(String file, long minSize) {
+        try {
+            Path p = Paths.get(file);
+            return Files.isRegularFile(p) && Files.size(p) > minSize;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Key identifying a record: table, rowid and values.
+     */
+    private static String recordKey(SqliteInternalRow row) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(row.getTableName()).append(' ').append(row.getRowId());
+        for (SqliteElementData d : row.getRowData()) {
+            sb.append(' ').append(d == null ? "" : d.toString());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * @return true, if the record was read from the cell pointer array of a page version
+     *         which is not the current one (a newer version of the page exists in the WAL file,
+     *         or it is an old frame of the WAL file or a page of the rollback journal)
+     */
+    private boolean isOldPageVersion(SqliteInternalRow row, Map<Integer, Integer> currentFrames) {
+        switch (row.getSource()) {
+            case DATABASE:
+                return currentFrames.containsKey((int) (row.getOffset() / ps) + 1);
+            case WAL:
+                if (wal == null)
+                    return false;
+                int idx = wal.frameIndex(row.getOffset());
+                if (idx < 0 || idx >= wal.frames.size())
+                    return true;
+                Integer current = currentFrames.get(wal.frames.get(idx).pagenumber);
+                return current == null || current != idx;
+            default:
+                /* the rollback journal holds former versions of pages */
+                return true;
+        }
+    }
+
+    /**
+     * Compare the records of the different versions of the pages (database file, WAL
+     * frames, rollback journal). The records found in the current version of the pages
+     * form the current state of the database. A record of an old page version
+     * <ul>
+     * <li>which is part of the current state is only a copy - it is not reported again</li>
+     * <li>which is not part of the current state was deleted or changed - it is reported
+     * as deleted record</li>
+     * </ul>
+     */
+    private void resolvePageVersions() {
+        Queue<SqliteInternalRow> rows = collectedRows;
+        collectedRows = null;
+        if (rows == null)
+            return;
+
+        Map<Integer, Integer> currentFrames = wal != null ? wal.currentFrames() : Collections.emptyMap();
+
+        Set<String> current = new HashSet<>();
+        Set<SqliteInternalRow> old = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (SqliteInternalRow row : rows) {
+            if (row.isDeletedRow())
+                continue;
+            if (isOldPageVersion(row, currentFrames))
+                old.add(row);
+            else
+                current.add(recordKey(row));
+        }
+
+        Set<String> reported = new HashSet<>();
+        for (SqliteInternalRow row : rows) {
+            if (old.contains(row)) {
+                String key = recordKey(row);
+                /* a copy of a current record, or the same old record in several page versions */
+                if (current.contains(key) || !reported.add(key))
+                    continue;
+                row.setRecordType(Global.DELETED_RECORD_IN_PAGE + row.getRecordType());
+            }
+            addRowNow(row);
+        }
+    }
+
     public void addRow(SqliteInternalRow row) {
+        Queue<SqliteInternalRow> collected = collectedRows;
+        if (collected != null) {
+            collected.add(row);
+            return;
+        }
+        addRowNow(row);
+    }
+
+    private void addRowNow(SqliteInternalRow row) {
         /* a deleted record with only NULL values holds no information (e.g. carved from zeroed space) */
         if (row.isDeletedRow() && Auxiliary.isEmptyRow(row)) {
             return;

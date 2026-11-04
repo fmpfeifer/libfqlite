@@ -389,6 +389,7 @@ public class Auxiliary extends Base {
 		if (!withoutROWID && (unkown || known.ROWID)) {
 			// read rowid as varint
 			rowid = readUnsignedVarInt(buffer);
+			row.setRowId(rowid);
 		}
 
 		// now read the header length as varint (the header length includes the varint itself)

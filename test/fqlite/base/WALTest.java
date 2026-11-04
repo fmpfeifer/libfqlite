@@ -101,6 +101,61 @@ public class WALTest {
         }
     }
 
+    private static long countRows(Path db, String table) throws Exception {
+        Path dir = java.nio.file.Files.createTempDirectory("walcount");
+        Path copy = dir.resolve("c.db");
+        java.nio.file.Files.copy(db, copy);
+        java.nio.file.Files.copy(Path.of(db + "-wal"), Path.of(copy + "-wal"));
+        try (java.sql.Connection c = TestSupport.open(copy); java.sql.Statement st = c.createStatement();
+                java.sql.ResultSet rs = st.executeQuery("SELECT count(*) FROM " + table)) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    /**
+     * secure_delete (default on Android) + WAL: the deleted records only survive in the
+     * former version of the pages in the database file. They must be reported as deleted,
+     * and the current records exactly once.
+     */
+    @Test
+    public void recordsDeletedInWalArePresentInDatabaseFile() throws Exception {
+        Path root = tmp.getRoot().toPath();
+        Path db = TestSupport.createWalDb(root, root.resolve("out"), "sw.db", c -> {
+            TestSupport.exec(c, "PRAGMA secure_delete=ON", "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+            insertRows(c);
+        }, c -> TestSupport.exec(c, "PRAGMA secure_delete=ON", "DELETE FROM t WHERE id % 3 = 0"));
+        Job job = TestSupport.run(db, Path.of(db + "-wal"));
+        long live = COMMITS * ROWS_PER_COMMIT - COMMITS * ROWS_PER_COMMIT / 3;
+        assertEquals(live, countRows(db, "t"));
+        assertEquals(live, TestSupport.countRegular(job, "t"));
+        Set<Long> deleted = job.getRowsForTable("t").stream().filter(SqliteRow::isDeletedRow)
+                .map(r -> r.getIntValue("id")).collect(Collectors.toSet());
+        for (long id = 3; id <= COMMITS * ROWS_PER_COMMIT; id += 3) {
+            assertTrue("deleted record " + id, deleted.contains(id));
+        }
+    }
+
+    /** Records changed in the WAL: the former values are reported as deleted, the current ones once. */
+    @Test
+    public void updatedRecordsInWal() throws Exception {
+        Path root = tmp.getRoot().toPath();
+        Path db = TestSupport.createWalDb(root, root.resolve("out"), "uw.db", c -> {
+            TestSupport.exec(c, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+            insertRows(c);
+        }, c -> TestSupport.exec(c, "UPDATE t SET v = 'new-' || id WHERE id <= 10"));
+        Job job = TestSupport.run(db, Path.of(db + "-wal"));
+        assertEquals(COMMITS * ROWS_PER_COMMIT, TestSupport.countRegular(job, "t"));
+        Set<String> current = job.getRowsForTable("t").stream().filter(r -> !r.isDeletedRow())
+                .map(r -> r.getTextValue("v")).collect(Collectors.toSet());
+        Set<String> former = job.getRowsForTable("t").stream().filter(SqliteRow::isDeletedRow)
+                .map(r -> r.getTextValue("v")).collect(Collectors.toSet());
+        for (int i = 0; i < 10; i++) {
+            assertTrue(current.contains("new-" + (i + 1)));
+            assertTrue(former.contains("walrow-0-" + i + "-" + TestSupport.repeat('x', 100)));
+        }
+    }
+
     /** Without readWAL nothing from the WAL is reported. */
     @Test
     public void walIgnoredWhenDisabled() throws Exception {

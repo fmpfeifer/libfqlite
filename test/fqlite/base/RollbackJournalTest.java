@@ -69,6 +69,8 @@ public class RollbackJournalTest {
         Path db = createAndFill("DELETE");
         Path out = tmp.newFolder().toPath().resolve("j.db");
         try (Connection c = TestSupport.open(db)) {
+            /* a tiny page cache: the changed pages are written to the database file before the commit */
+            TestSupport.exec(c, "PRAGMA cache_size=1");
             c.setAutoCommit(false);
             TestSupport.exec(c, "UPDATE t SET v = 'changed'");
             Files.copy(db, out, StandardCopyOption.REPLACE_EXISTING);
@@ -76,7 +78,33 @@ public class RollbackJournalTest {
             c.rollback();
         }
         Job job = runWithJournal(out);
-        assertTrue(journalValues(job).containsAll(expected()));
+        /* pages written to the database file: the original values only exist in the journal (deleted) */
+        Set<String> journal = journalValues(job);
+        assertTrue(!journal.isEmpty());
+        assertTrue(job.getRowsForTable("t").stream().filter(r -> r.getSource() == RecordSource.ROLLBACK_JOURNAL)
+                .allMatch(SqliteRow::isDeletedRow));
+        /* pages still unchanged in the database file: the values are current records */
+        Set<String> all = new HashSet<>(journal);
+        job.getRowsForTable("t").stream().filter(r -> !r.isDeletedRow()).map(r -> r.getTextValue("v")).forEach(all::add);
+        assertTrue(all.containsAll(expected()));
+    }
+
+    /** Journal pages identical to the database pages are not reported twice. */
+    @Test
+    public void unchangedJournalPagesAreNotReportedTwice() throws Exception {
+        Path db = createAndFill("DELETE");
+        Path out = tmp.newFolder().toPath().resolve("j.db");
+        try (Connection c = TestSupport.open(db)) {
+            c.setAutoCommit(false);
+            /* the change stays in the page cache, the database file is unchanged */
+            TestSupport.exec(c, "UPDATE t SET v = 'changed'");
+            Files.copy(db, out, StandardCopyOption.REPLACE_EXISTING);
+            Files.copy(Path.of(db + "-journal"), Path.of(out + "-journal"), StandardCopyOption.REPLACE_EXISTING);
+            c.rollback();
+        }
+        Job job = runWithJournal(out);
+        assertTrue(journalValues(job).isEmpty());
+        assertTrue(job.getRowsForTable("t").stream().filter(r -> !r.isDeletedRow()).count() == ROWS);
     }
 
     /** In PERSIST mode the journal header is zeroed after the commit, but the pages are still there. */

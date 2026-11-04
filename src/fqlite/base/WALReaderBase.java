@@ -6,7 +6,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.BitSet;
 import java.util.LinkedList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -398,9 +400,45 @@ public abstract class WALReaderBase extends Base {
 		info("Checkpoints ", checkpoints);
 	}
 	
+	/* all frames in the order of the file */
+	List<WALFrame> frames = new java.util.ArrayList<WALFrame>();
+
+	/**
+	 * Determine the current version of each database page in the WAL file: the last
+	 * valid frame (salt values of the WAL header) of a page which is not behind the
+	 * last commit frame. Older frames, frames of former checkpoints (other salt values)
+	 * and uncommitted frames do not belong to the current state of the database.
+	 * 
+	 * @return map: page number -> index of the frame holding the current version
+	 */
+	Map<Integer, Integer> currentFrames() {
+		int lastCommit = -1;
+		for (int i = 0; i < frames.size(); i++) {
+			WALFrame f = frames.get(i);
+			if (f.salt1 == hsalt1 && f.salt2 == hsalt2 && f.committed)
+				lastCommit = i;
+		}
+		Map<Integer, Integer> current = new HashMap<Integer, Integer>();
+		for (int i = 0; i <= lastCommit; i++) {
+			WALFrame f = frames.get(i);
+			if (f.salt1 == hsalt1 && f.salt2 == hsalt2)
+				current.put(f.pagenumber, i);
+		}
+		return current;
+	}
+
+	/**
+	 * @param offset offset in the WAL file
+	 * @return the index of the frame containing the offset
+	 */
+	int frameIndex(long offset) {
+		return (int) ((offset - 32) / (ps + 24));
+	}
+
 	private WALFrame updateCheckpoint(int pagenumber, int framenumber,long salt1, long salt2, boolean committed){
 		
 		WALFrame f = new WALFrame(pagenumber, framenumber , salt1, salt2,  committed);
+		frames.add(f);
 
 		
 		/* new checkpoint/transaction id? */
