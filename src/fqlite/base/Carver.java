@@ -28,6 +28,12 @@ public class Carver extends Base {
 
 	int pagenumber;
 
+	/* file the carved page belongs to */
+	RecordSource source = RecordSource.DATABASE;
+
+	/* offset of the page inside a WAL/journal file, or -1 for pages of the main db file */
+	long pageFileOffset = -1;
+
 	/**
 	 * Constructor.
 	 * 
@@ -148,7 +154,7 @@ public class Carver extends Base {
 			if (true) {
 				try {
 					
-					if (pagenumber >  job.numberofpages)
+					if (pageFileOffset < 0 && pagenumber >  job.numberofpages)
 						continue;
 					
 					CarvingResult res = c.readDeletedRecord(job, end, block, m, bs, pagenumber);
@@ -169,6 +175,11 @@ public class Carver extends Base {
 					if (null != row) { // && rc.length() > 0) {
 					    row.setTableName(tbd.tblname);
 					    row.setRecordType(Global.DELETED_RECORD_IN_PAGE);
+					    row.setSource(source);
+					    if (pageFileOffset >= 0) {
+					        /* offset relative to the WAL/journal file */
+					        row.setOffset(pageFileOffset + (row.getOffset() - (long) (pagenumber - 1) * job.ps));
+					    }
 					    job.addRow(row);
 					}
 

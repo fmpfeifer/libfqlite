@@ -222,24 +222,37 @@ public class Job extends Base {
 	  
 	/******************************************************************************************************/
 	
-	private RandomAccessFileReader readWAL(String walpath) throws IOException {
-		
-		Path p = Paths.get(walpath);
-		if (! Files.exists(p)) {
-		    return null;
+	/**
+	 * Search for schema entries (sqlite_master records) in every page stored in the WAL archive.
+	 */
+	private void readDBSchemaFromWAL(int goBack, ByteSeqSearcher btsearch, ByteSeqSearcher bisearch) throws IOException {
+		String wp = walpath != null ? walpath : path + "-wal";
+		Path p = Paths.get(wp);
+		if (!Files.exists(p)) {
+		    return;
 		}
 
-		/* First - try to analyze the db-schema */
-		/*
-		 * we have to do this before we open the database because of the concurrent
-		 * access in multi threading mode
-		 */
-
-		/* try to open the wal-file in read-only mode */
-		RandomAccessFileReader file = new RandomAccessFileReader(p);
-		resourcesToClose.addFirst(file);
-		return file;
-		
+		try (RandomAccessFileReader walfile = new RandomAccessFileReader(p)) {
+		    ByteBuffer walheader = walfile.allocateAndReadBuffer(0, 32);
+		    if (walheader == null) {
+		        return;
+		    }
+		    int walps = walheader.getInt(8);
+		    if (walps == 1)
+		        walps = 65536;
+		    if (walps != ps) {
+		        warning("Page size of WAL file (", walps, ") differs from database page size (", ps, ")");
+		        return;
+		    }
+		    /* each frame: 24 bytes frame header + page */
+		    for (long frame = 32; frame + 24 + ps <= walfile.size(); frame += 24 + ps) {
+		        ByteBuffer page = walfile.allocateAndReadBuffer(frame + 24, ps);
+		        if (page == null) {
+		            break;
+		        }
+		        readDBSchema(new LongPositionByteBufferWrapper(page), goBack, btsearch, bisearch, 1, true);
+		    }
+		}
 	}
 	
 	protected void tableDescriptorReady(TableDescriptor td) {
@@ -554,54 +567,31 @@ public class Job extends Base {
             /* to mark the start of an indices entry for the sqlmaster_table */
             final ByteSeqSearcher bisearch = new ByteSeqSearcher(ipattern);
 			
-			boolean again = false;
-			int round = 0;
-			RandomAccessFileReader bb = file;
-			
 			// try to read DB schema following btree.
-			exploreBTree(1, 
+			exploreBTree(1,
 			        pageNumber -> {
-			            readDBSchema(new LongPositionByteBufferWrapper(readPageWithNumber(pageNumber-1, ps)),
-			                goBack, btsearch, bisearch, 1, true);
+			            ByteBuffer page = readPageWithNumber(pageNumber - 1, ps);
+			            if (page != null) {
+			                readDBSchema(new LongPositionByteBufferWrapper(page),
+			                    goBack, btsearch, bisearch, 1, true);
+			            }
 			        }
 			);
-			
-			/**
-			 * Step into loop
-			 * 
-			 * 1. iteration:  Try to read table and index information from normal database
-			 * 
-			 * 2. iteration:  No information found but a WAL archive in place - try to get the
-			 *                missing information in a second look from the WAL archive
-			 * 
+
+			/*
+			 * 1. Try to read table and index information from the whole database file
+			 *    (this finds deleted schema entries too)
+			 *
+			 * 2. No information found but a WAL archive in place - try to get the
+			 *    missing information from the pages stored in the WAL archive
 			 */
-			do
-			{
-				round++;
-				
-				if (round == 2 && !readWAL)
-					break;
-				
-				readDBSchema(bb, goback, btsearch, bisearch, round, false);
-							
-				/* Is there a table schema definition inside the main database file ???? */
-				info("headers:::: ", headers.size());
-				
-				if(headers.size()==0 && this.readWAL ==true)
-				{
-					// second try - maybe we could find a schema definition inside of the WAL-archive file instead?!
-					
-				    info("Could not find a schema definition inside the main db-file. Try to find something inside the WAL archive");
-				
-				    bb = readWAL(this.path+"-wal");
-				    
-				    if (null != bb)
-				    	again = true;
-					
-				}
-			
+			readDBSchema(file, goback, btsearch, bisearch, 1, false);
+			info("headers:::: ", headers.size());
+
+			if (headers.size() == 0 && readWAL) {
+			    info("Could not find a schema definition inside the main db-file. Try to find something inside the WAL archive");
+			    readDBSchemaFromWAL(goBack, btsearch, bisearch);
 			}
-			while(again && round < 2 && readWAL && !readRollbackJournal);
 
 			/*******************************************************************/
 
@@ -893,7 +883,9 @@ public class Job extends Base {
 			/*******************************************************************/
 			
 			if (readRollbackJournal) {
-	            /* the readWAL option is enabled -> check the WAL-file too */
+	            /* the readRollbackJournal option is enabled -> check the journal file too */
+	            if (rollbackjournalpath == null)
+	                rollbackjournalpath = path + "-journal";
 	            Logger.out.info(" RollbackJournal-File ", this.rollbackjournalpath);
 	            rol = new RollbackJournalReaderBase(rollbackjournalpath, this) {
                     @Override
@@ -901,17 +893,21 @@ public class Job extends Base {
                     }
 	            };
 	            rol.ps = this.ps;
+	            rol.tables.addAll(recoveryTables);
 	            /* start parsing Rollbackjournal-file */
 	            rol.parse();
 	        }
 	        if (readWAL) {
 	            /* the readWAL option is enabled -> check the WAL-file too */
+	            if (walpath == null)
+	                walpath = path + "-wal";
 	            Logger.out.info(" WAL-File ", walpath);
 	            wal = new WALReaderBase(walpath, this) {
                     @Override
                     public void output() {                        
                     }
                 };
+	            wal.tables.addAll(recoveryTables);
 	            /* start parsing WAL-file */
 	            wal.parse();
 	        }
@@ -961,7 +957,13 @@ public class Job extends Base {
             /* search as long as we can find further table keywords */
             while (index != -1) {
                 /* get Header */
-                bb.position(index - goback - 3);
+                long headerpos = index - goback - 3;
+                if (headerpos < 0) {
+                    /* not enough bytes before the keyword for a record header */
+                    index = bsearch.indexOf(bb, index + 2);
+                    continue;
+                }
+                bb.position(headerpos);
                 int hsize = Math.min(40, (int) (bb.size() - bb.position()));
                 if (hsize < 20) {
                     break;
@@ -970,80 +972,40 @@ public class Job extends Base {
 
                 bb.get(mheader);
 
+                int starthere = -1;
+                int headerSize = 0;
                 int [] valData = aux.validateIntactMasterTableHeader(mheader, goback + 3 - 5);
                 int headerStart = valData[0];
-                int headerSize = valData[1];
                 if (headerStart != Integer.MIN_VALUE) {
+                    headerSize = valData[1];
                     headerStart += 1;
                     // compute offset
-                    int starthere = (int)(index % ps) - goback + headerStart - 3;
-
-                    if (starthere >= 0) {
-                        ByteBuffer bbb = null;
-                        if (round == 1) {
-                            if (isSinglePage) {
-                                bbb = bb.allocateAndReadBuffer(0, ps);
-                            } else {
-                                int pagenumber = (int)(index / ps);
-                                bbb = readPageWithNumber(pagenumber, ps);
-                            }
-                        } else {
-                            starthere = (int) ((index - 32) % (ps + 24)) - goback + headerStart - 3;
-                            bbb = bb.allocateAndReadBuffer(32 + 24 + index/ps, ps);
-                        }
-                        if (bbb == null) {
-                            break;
-                        }
-                        aux.readMasterTableRecord(starthere, bbb, headerSize);
-                    }
+                    starthere = (int)(index % ps) - goback + headerStart - 3;
                 } else {
                     valData = aux.validateOverwrittenMasterTableHeader(mheader, goback + 3 - 5);
                     headerStart = valData[0];
-                    headerSize = valData[1];
-                    if (headerStart != Integer.MIN_VALUE) {                         
+                    if (headerStart != Integer.MIN_VALUE) {
+                        headerSize = valData[1];
                         headerStart += 1;
-                        int starthere = (int) (index % ps) - goback - headerStart - 3;
-                        
-                        if (starthere >= 0) {
-                            ByteBuffer bbb = null;
-                            /* first try to read the db schema from the main db file */
-                            if (round == 1)
-                            {
-                                if (isSinglePage) {
-                                    bbb = bb.allocateAndReadBuffer(0, ps);
-                                } else {
-                                    int pagenumber = (int) (index / ps);
-                                    bbb = readPageWithNumber(pagenumber, ps);
-                                }
-                            }
-                            /* No schema was found? Try reading the WAL file instead */
-                            else
-                            {
-                                long pagebegin = 0;
-                                // first page ?
-                                if (index < (ps + 56))
-                                {
-                                    // skip WAL header (32 Bytes) and frame header (24 Bytes)
-                                    pagebegin = 56;
-                                    starthere  = (int) (index - 56)  - goback - headerStart - 3;
-                                }
-                                else
-                                {
-                                    pagebegin = ((index - 32) / (ps + 24)) * (ps + 24) - 24 + 32;      //32 + (ps+24)*index/(ps+24) + 24;
-                                    starthere = (int) ((index - 32) % (ps + 24) + 24)  - goback - headerStart - 3;
-                                }
-                                
-                                /* go to frame start */
-                                bbb = file.allocateAndReadBuffer(pagebegin, ps);
-                                
-                            }
-                            if (bbb == null) {
-                                break;
-                            }
-                            
-                            /* start reading the schema string from the correct position */
-                            aux.readMasterTableRecord(starthere, bbb, headerSize);
-                        }
+                        starthere = (int) (index % ps) - goback - headerStart - 3;
+                    }
+                }
+
+                if (starthere >= 0) {
+                    ByteBuffer bbb;
+                    if (isSinglePage) {
+                        bbb = bb.allocateAndReadBuffer(0, ps);
+                    } else {
+                        bbb = readPageWithNumber(index / ps, ps);
+                    }
+                    if (bbb == null) {
+                        break;
+                    }
+                    try {
+                        /* start reading the schema string from the correct position */
+                        aux.readMasterTableRecord(starthere, bbb, headerSize);
+                    } catch (RuntimeException e) {
+                        debug("Could not read schema record at ", index, ": ", e);
                     }
                 }
                 /* search for more component entries */

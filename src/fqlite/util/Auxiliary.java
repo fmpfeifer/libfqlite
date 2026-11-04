@@ -15,6 +15,7 @@ import fqlite.base.Job;
 import fqlite.base.SqliteElement;
 import fqlite.base.SqliteElementData;
 import fqlite.base.SqliteInternalRow;
+import fqlite.descriptor.AbstractDescriptor;
 import fqlite.descriptor.IndexDescriptor;
 import fqlite.descriptor.TableDescriptor;
 import fqlite.pattern.HeaderPattern;
@@ -223,7 +224,7 @@ public class Auxiliary extends Base {
 
 		boolean error = false;
 
-		row.setOffset((pagenumber - 1) * job.ps + buffer.position());
+		row.setOffset((long) (pagenumber - 1) * job.ps + buffer.position());
 
 		/* use the header information to reconstruct */
 		int pll = computePayloadLength(header);
@@ -389,76 +390,50 @@ public class Auxiliary extends Base {
 		// prepare the string for the return value
 		SqliteInternalRow row = new SqliteInternalRow();
 
-		/* For WAL and ROL files the values is always greater than 0 */
+		/* is the component of this page known? */
+		boolean pageInRange = pagenumber_db >= 0 && pagenumber_db < job.pages.length;
+		AbstractDescriptor known = pageInRange ? job.pages[pagenumber_db] : null;
+
+		row.setRecordType(Global.REGULAR_RECORD);
+		/* For WAL and ROL files the file pointer is always greater than 0 */
 		if (filepointer > 0) {
-			if (job.pages.length > pagenumber_db) {
-				if (null != job.pages[pagenumber_db]) {
-				    row.setTableName(job.pages[pagenumber_db].getName());
-					//lineUTF.append(job.pages[pagenumber_db].getName() + ";");
-				}
-			} else {
-				//lineUTF.append("__UNASSIGNED;");
-			    row.setTableName("__UNASSIGNED");
-				// unkown=true;
-			}
-
-			row.setRecordType(Global.REGULAR_RECORD);
-			row.setOffset(filepointer + cellstart);
-
-			//lineUTF.append(filepointer + cellstart + ";");
-
-		} else
-		/* first, add component name if known */
-		if (null != job.pages[pagenumber_db]) {
-		    row.setTableName(job.pages[pagenumber_db].getName());
-			//lineUTF.append(job.pages[pagenumber_db].getName() + ";");
-			row.setRecordType(Global.REGULAR_RECORD);
-		    //lineUTF.append(Global.REGULAR_RECORD + ";");
-
+			row.setOffset((long) filepointer + cellstart);
+		} else {
 			/*
 			 * for a regular db-file the offset is derived from the page number, since all
 			 * pages are a multiple of the page size (ps).
 			 */
-			row.setOffset((pagenumber_db - 1) * job.ps + cellstart);
-			//lineUTF.append((pagenumber_db - 1) * job.ps + cellstart + ";");
+			row.setOffset((long) (pagenumber_db - 1) * job.ps + cellstart);
+		}
 
+		if (null != known) {
+			/* first, add component name if known */
+			row.setTableName(known.getName());
 		} else {
 			/*
-			 * component is not part of btree - page on free list -> need to determine name
-			 * of component
+			 * component is not part of btree - page on free list or only present in a
+			 * WAL/journal file -> need to determine name of component
 			 */
 			unkown = true;
 		}
 
-		info("cellstart for pll: ", ((pagenumber_db - 1) * job.ps + cellstart));
+		if (cellstart < 0 || cellstart >= buffer.limit())
+			return null;
+
 		// length of payload as varint
 		buffer.position(cellstart);
-		int pll = (int) readUnsignedVarInt(buffer);
-		debug("Length of payload int : ", pll, " as hex : ", Integer.toHexString(pll));
-
-		if (pll < 4)
+		long lpll = readUnsignedVarInt(buffer);
+		if (lpll < 4 || lpll > Integer.MAX_VALUE)
 			return null;
+		int pll = (int) lpll;
+		debug("Length of payload int : ", pll);
 
 		long rowid = 0;
 
 		/* Do we have a ROWID component or not? 95% of SQLite Tables have a ROWID */
-		if (!withoutROWID) {
-
-			if (unkown) {
-				rowid = readUnsignedVarInt(buffer);
-				debug("rowid: ", Long.toHexString(rowid));
-			} else {
-				if (pagenumber_db >= job.pages.length) {
-
-				} else if (null == job.pages[pagenumber_db] || job.pages[pagenumber_db].ROWID) {
-					// read rowid as varint
-					rowid = readUnsignedVarInt(buffer);
-					debug("rowid: ", Long.toHexString(rowid));
-					// We do not use this key in the moment.
-					// However, we have to read the value.
-				}
-
-			}
+		if (!withoutROWID && (unkown || known.ROWID)) {
+			// read rowid as varint
+			rowid = readUnsignedVarInt(buffer);
 		}
 
 		// now read the header length as varint
@@ -515,20 +490,12 @@ public class Auxiliary extends Base {
 
 				/* this is only neccessesary, when component name is unkown */
 				if (null == td)
-					//lineUTF.append("__UNASSIGNED" + ";");
 				    row.setTableName("__UNASSIGNED");
 				else {
 				    row.setTableName(td.tblname);
-					//lineUTF.append(td.tblname + ";");
-					job.pages[pagenumber_db] = td;
+				    if (pageInRange)
+				        job.pages[pagenumber_db] = td;
 				}
-
-				row.setRecordType(Global.REGULAR_RECORD);
-				row.setOffset((pagenumber_db - 1) * job.ps + cellstart);
-
-				//lineUTF.append(Global.REGULAR_RECORD + ";");
-				//lineUTF.append((pagenumber_db - 1) * job.ps + cellstart + ";");
-
 			}
 		} catch (NullPointerException err) {
 			System.err.println(err);

@@ -12,6 +12,7 @@ public class SqliteInternalRow {
     private String tableName = "";
     private String recordType = "";
     private String lineSuffix = "";
+    private RecordSource source = RecordSource.DATABASE;
     private Map<String, Integer> colIdx = null;
 
     void setColumnNamesMap(Map<String, Integer> colIdx) {
@@ -70,6 +71,17 @@ public class SqliteInternalRow {
         return lineSuffix;
     }
     
+    /**
+     * @return the file this record was read from
+     */
+    public RecordSource getSource() {
+        return source;
+    }
+
+    public void setSource(RecordSource source) {
+        this.source = source;
+    }
+
     public void setLineSuffix(String lineSuffix) {
         this.lineSuffix = lineSuffix;
     }
@@ -153,6 +165,8 @@ public class SqliteInternalRow {
         result.setTableName(tableName);
         result.setDeletedRow(isDeletedRow());
         result.setColumnNamesMap(colIdx);
+        result.setSource(source);
+        result.setOffset(offset);
         Object [] data = new Object[rowData.size()];
         for (int i = 0; i < data.length; i++) {
             SqliteElementData d = rowData.get(i);

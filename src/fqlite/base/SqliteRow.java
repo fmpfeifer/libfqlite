@@ -11,6 +11,30 @@ public class SqliteRow {
     private boolean deleted;
     private Map<String, Integer> colIdx = null;
     private Charset charset = StandardCharsets.UTF_8;
+    private RecordSource source = RecordSource.DATABASE;
+    private long offset = 0L;
+
+    /**
+     * @return the file this record was read from
+     */
+    public RecordSource getSource() {
+        return source;
+    }
+
+    void setSource(RecordSource source) {
+        this.source = source;
+    }
+
+    /**
+     * @return offset of the record inside the file it was read from (see {@link #getSource()})
+     */
+    public long getOffset() {
+        return offset;
+    }
+
+    void setOffset(long offset) {
+        this.offset = offset;
+    }
 
     void setColumnNamesMap(Map<String, Integer> colIdx) {
         this.colIdx = colIdx;
