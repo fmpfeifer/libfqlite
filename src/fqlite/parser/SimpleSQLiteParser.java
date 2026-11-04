@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonTokenStream;
@@ -114,7 +115,7 @@ public class SimpleSQLiteParser extends Base {
 	
 	public IndexDescriptor parseIndex(String stmt)
 	{
-		if ((stmt.indexOf("CREATE INDEX ") >= 0))
+		if (stmt.indexOf("CREATE INDEX ") >= 0 || stmt.indexOf("CREATE UNIQUE INDEX ") >= 0)
 		{
 			return parseCreateIndex(stmt);
 		}
@@ -126,6 +127,16 @@ public class SimpleSQLiteParser extends Base {
 	
 	
 	
+	private static final Pattern WITHOUT_ROWID = Pattern.compile("\\bWITHOUT\\s+ROWID\\b", Pattern.CASE_INSENSITIVE);
+
+	/**
+	 * @param stmt a CREATE TABLE statement
+	 * @return true, if the table is declared as WITHOUT ROWID (key words are case insensitive)
+	 */
+	public static boolean isWithoutRowid(String stmt) {
+		return stmt != null && WITHOUT_ROWID.matcher(stmt).find();
+	}
+
 	public String trim(String value)
 	{
 		if (value.startsWith("'") || value.startsWith("\""))
@@ -214,7 +225,7 @@ public class SimpleSQLiteParser extends Base {
         	
         },tree);
 	
-		tds = new TableDescriptor(tablename,stmt,sqltypes,coltypes,colnames,colconstraints,tableconstraint,null,stmt.contains("WITHOUT ROWID"));
+		tds = new TableDescriptor(tablename,stmt,sqltypes,coltypes,colnames,colconstraints,tableconstraint,null,isWithoutRowid(stmt));
 		
 		tds.setVirtual(true);
 		if (null!=modulname)
@@ -347,6 +358,8 @@ public class SimpleSQLiteParser extends Base {
         		{
         			colname = trim(colname);
         			colnames.add(colname);
+        			inColumnDef = true;
+        			typeSeen = false;
         			
         			info("Columnname " + colname);
         		}
@@ -395,12 +408,12 @@ public class SimpleSQLiteParser extends Base {
 	        		sqltypes.add(value);
 	        		info("SQLType::" + value);
 	        		String type = getType(value);
-	        		if (type.length()>0)
-	        		{
-	        			coltypes.add(type);
-	        			info("Typename " + trim(type));
-	            		
-	        		}
+	        		/* SQLite: a type name without any of the known key words has NUMERIC affinity */
+	        		if (type.length() == 0)
+	        			type = "NUMERIC";
+	        		coltypes.add(type);
+	        		typeSeen = true;
+	        		info("Typename " + trim(type));
         		}
         		
         	}
@@ -437,8 +450,22 @@ public class SimpleSQLiteParser extends Base {
         	
         
         	
+        	/* true while a column definition is parsed and whether it declared a type */
+        	boolean inColumnDef = false;
+        	boolean typeSeen = false;
+
         	@Override public void exitColumn_def(SQLiteParser.Column_defContext ctx) 
         	{ 
+        		/*
+        		 * a column without type name - keep the type lists aligned with the column names.
+        		 * Such a column can hold values of any type -> NUMERIC (matches every serial type)
+        		 */
+        		if (inColumnDef && !typeSeen)
+        		{
+        			sqltypes.add("");
+        			coltypes.add("NUMERIC");
+        		}
+        		inColumnDef = false;
        	        info("adding cons:" + cons);
         		colconstraints.add(cons);
         		column++;
@@ -499,7 +526,7 @@ public class SimpleSQLiteParser extends Base {
         		}
 	        		
     	
-        		tds = new TableDescriptor(tablename,stmt,sqltypes,coltypes,colnames,colconstraints,tableconstraint,pattern,stmt.contains("WITHOUT ROWID"));
+        		tds = new TableDescriptor(tablename,stmt,sqltypes,coltypes,colnames,colconstraints,tableconstraint,pattern,isWithoutRowid(stmt));
         		info("PATTTERN: " + pattern);
         		
         	}

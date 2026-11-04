@@ -84,8 +84,7 @@ public class SQLiteSchemaParser {
 			
 		}
 		
-		int indexrowid = sql.indexOf("WITHOUT ROWID");
-		if (indexrowid != -1) {
+		if (SimpleSQLiteParser.isWithoutRowid(sql)) {
 			Logger.out.debug(" attention: component " + tablename + " is defined as WITHOUT ROWID");
 			rowid = false;
 		}	
@@ -117,7 +116,7 @@ public class SQLiteSchemaParser {
 				}
 			}
 		}
-		else if (sql.contains("CREATE INDEX"))
+		else if (sql.contains("CREATE INDEX") || sql.contains("CREATE UNIQUE INDEX"))
 		{
 			IndexDescriptor ids = p.parseCREATEIndexStatement(sql);
 			
