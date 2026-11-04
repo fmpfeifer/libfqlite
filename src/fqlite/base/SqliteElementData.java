@@ -49,6 +49,16 @@ public class SqliteElementData {
         this.charset = charset;
     }
     
+    /**
+     * @return the value without any conversion (e.g. of timestamps), to compare values
+     */
+    String rawKey() {
+        Object o = getObject(false);
+        if (o instanceof byte[])
+            return fqlite.util.Auxiliary.bytesToHex((byte[]) o);
+        return o == null ? "NULL" : o.getClass().getSimpleName() + ":" + o;
+    }
+
     public String toString() {
         if (null == column) {
             if (null == data) {

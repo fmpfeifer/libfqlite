@@ -115,6 +115,42 @@ public class RecoveryStrategiesTest {
         assertEquals(2250, TestSupport.countRegular(job, "kv"));
     }
 
+    /**
+     * secure_delete=FAST cleans the deleted records of the table, but entries of an index
+     * survive: the records are reported partially (indexed columns and rowid).
+     */
+    @Test
+    public void deletedRecordsFromIndexEntries() throws Exception {
+        Path db = TestSupport.createDb(tmp.getRoot().toPath(), "idx.db", c -> {
+            TestSupport.exec(c, "CREATE TABLE msgs(id INTEGER PRIMARY KEY, ts INTEGER, sender TEXT, body TEXT)",
+                    "CREATE INDEX idx_sender ON msgs(sender)");
+            c.setAutoCommit(false);
+            for (int i = 1; i <= 3000; i++) {
+                TestSupport.exec(c, "INSERT INTO msgs VALUES(" + i + ", " + i + ", 'sender" + (i % 50) + "', '"
+                        + body(i, 10 + i % 290) + "')");
+            }
+            c.commit();
+            c.setAutoCommit(true);
+            TestSupport.exec(c, "PRAGMA secure_delete=FAST", "DELETE FROM msgs WHERE id % 4 = 0");
+        });
+        Job job = TestSupport.run(db);
+        assertEquals(2250, TestSupport.countRegular(job, "msgs"));
+        int fromIndex = 0;
+        for (SqliteRow r : job.getRowsForTable("msgs")) {
+            /* records rebuilt from index entries: rowid and indexed column only */
+            if (r.isDeletedRow() && r.getTextValue("body") == null && r.getTextValue("sender") != null
+                    && r.getIntValue("id") != Long.MIN_VALUE) {
+                long id = r.getIntValue("id");
+                assertEquals("deleted record " + id, 0, id % 4);
+                assertEquals("sender" + (id % 50), r.getTextValue("sender"));
+                fromIndex++;
+            }
+        }
+        assertTrue("records rebuilt from index entries: " + fromIndex, fromIndex > 20);
+        /* the indices are not reported as tables */
+        assertFalse(job.getTablesNames().contains("idx_sender"));
+    }
+
     /** Copies of current records left in free space by b-tree balancing are no deleted records. */
     @Test
     public void copiesOfLiveRecordsAreNotReportedAsDeleted() throws Exception {

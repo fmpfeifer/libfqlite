@@ -893,6 +893,23 @@ public class Job extends Base {
 			// full db-scan (including all database pages)
 			scan(numberofpages, ps, recoveryTables);
 
+			/* deleted records which only survived as index entries */
+			indexRecovery = new IndexEntryRecovery(this, aux);
+			if (!indexRecovery.isEmpty()) {
+				Map<IndexDescriptor, java.util.Collection<Integer>> leaves = new HashMap<>();
+				for (IndexDescriptor id : indices.values()) {
+					List<Integer> l = new ArrayList<>();
+					exploreBTree(id.getRootOffset(), l::add, true);
+					leaves.put(id, l);
+				}
+				try {
+					indexRecovery.recoverFromIndexPages(leaves);
+					indexRecovery.recoverFromFreelist(new ArrayList<>(freelistPages));
+				} catch (RuntimeException e) {
+					err("Error while recovering index entries: ", e);
+				}
+			}
+
 			/*******************************************************************/
 			
 			if (readRollbackJournal) {
@@ -1462,6 +1479,9 @@ public class Job extends Base {
 
     }
 
+    /* recovery of deleted records from index entries */
+    private IndexEntryRecovery indexRecovery = null;
+
     /* records collected until the versions of the pages are resolved (null: add immediately) */
     private volatile Queue<SqliteInternalRow> collectedRows = null;
 
@@ -1479,9 +1499,9 @@ public class Job extends Base {
      */
     private static String recordKey(SqliteInternalRow row) {
         StringBuilder sb = new StringBuilder();
-        sb.append(row.getTableName()).append(' ').append(row.getRowId());
+        sb.append(row.getTableName()).append('\u0000').append(row.getRowId());
         for (SqliteElementData d : row.getRowData()) {
-            sb.append(' ').append(d == null ? "" : d.toString());
+            sb.append('\u0000').append(d == null ? "" : d.rawKey());
         }
         return sb.toString();
     }
@@ -1540,7 +1560,12 @@ public class Job extends Base {
 
         Set<String> reported = new HashSet<>();
         List<SqliteInternalRow> result = new ArrayList<>(rows.size());
+        Set<Integer> indexPages = indexRecovery != null ? indexRecovery.attributedPages : Collections.emptySet();
         for (SqliteInternalRow row : rows) {
+            /* records of freelist pages attributed to an index are reported as index entries */
+            if (!indexPages.isEmpty() && row.getSource() == RecordSource.DATABASE
+                    && "__UNASSIGNED".equals(row.getTableName()) && indexPages.contains((int) (row.getOffset() / ps) + 1))
+                continue;
             if (old.contains(row)) {
                 String key = recordKey(row);
                 /* a copy of a current record, or the same old record in several page versions */
@@ -1562,11 +1587,15 @@ public class Job extends Base {
                 }
             }
         }
+        List<SqliteInternalRow> fromIndices = indexRecovery != null ? indexRecovery.select(result) : Collections.emptyList();
+        indexRecovery = null;
         for (SqliteInternalRow row : result) {
             if (!live.isEmpty() && row.isDeletedRow() && isCopyOfLiveRecord(row, live))
                 continue;
             addRowNow(row);
         }
+        for (SqliteInternalRow row : fromIndices)
+            addRowNow(row);
     }
 
     /**
@@ -1588,7 +1617,7 @@ public class Job extends Base {
             Object o = d == null ? null : d.getObject(false);
             if (o != null)
                 values++;
-            sb.append(' ').append(d == null ? "" : d.toString());
+            sb.append('\u0000').append(d == null ? "" : d.rawKey());
         }
         return values < 2 ? null : sb.toString();
     }
