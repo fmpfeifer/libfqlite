@@ -9,8 +9,8 @@ public class Global {
     public static final String UNALLOCATED_SPACE = "U"; // U2318 - unallocated space
     /* record rebuilt from a deleted index entry: only the indexed columns and the rowid are known */
     public static final String INDEX_ENTRY = "I";
-    public static final String FQLITE_VERSION = "1.57.05";
-    public static final String FQLITE_RELEASEDATE = "04/01/2022";
+    public static final String FQLITE_VERSION = "1.57.08";
+    public static final String FQLITE_RELEASEDATE = "04/11/2026";
     public static final int CARVING_ERROR = -1;
     public static boolean CONVERT_DATETIME = true; // Weather to convert datetime or not
     public static int LOGLEVEL = Base.ERROR;
