@@ -81,6 +81,40 @@ public class RecoveryStrategiesTest {
         assertTrue("not recovered: " + recoverable, recoverable.isEmpty());
     }
 
+    /**
+     * WITHOUT ROWID tables have no rowid in their cells: the freeblock header overwrites the
+     * header size and the first serial types of a deleted record. The records are rebuilt
+     * from the bounds of the freeblock and the schema.
+     */
+    @Test
+    public void freeblocksOfWithoutRowidTable() throws Exception {
+        Path db = TestSupport.createDb(tmp.getRoot().toPath(), "wr.db", c -> {
+            TestSupport.exec(c, "PRAGMA secure_delete=OFF",
+                    "CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT, n INTEGER) WITHOUT ROWID");
+            c.setAutoCommit(false);
+            for (int i = 1; i <= 3000; i++) {
+                TestSupport.exec(c, "INSERT INTO kv VALUES('" + String.format("key-%06d", i) + "', '"
+                        + body(i, 5 + (i * 37) % 200) + "', " + i + ")");
+            }
+            c.commit();
+            c.setAutoCommit(true);
+            TestSupport.exec(c, "DELETE FROM kv WHERE n % 4 = 0");
+        });
+        Job job = TestSupport.run(db);
+        Set<Long> correct = new HashSet<>();
+        for (SqliteRow r : job.getRowsForTable("kv")) {
+            String k = r.getTextValue("k");
+            String v = r.getTextValue("v");
+            long n = r.getIntValue("n");
+            if (r.isDeletedRow() && n % 4 == 0 && String.format("key-%06d", n).equals(k) && v != null
+                    && v.startsWith("msg-" + n + "- ")) {
+                correct.add(n);
+            }
+        }
+        assertTrue("correctly rebuilt: " + correct.size(), correct.size() >= 700);
+        assertEquals(2250, TestSupport.countRegular(job, "kv"));
+    }
+
     /** Pages of a table whose schema entry was destroyed are not referenced by any b-tree. */
     @Test
     public void pagesWithoutSchema() throws Exception {

@@ -15,6 +15,7 @@ import fqlite.descriptor.TableDescriptor;
 import fqlite.pattern.SerialTypeMatcher;
 import fqlite.types.CarverTypes;
 import fqlite.util.Auxiliary;
+import fqlite.util.FreeblockReconstructor;
 import fqlite.util.RandomAccessFileReader;
 
 /**
@@ -365,6 +366,7 @@ public abstract class RollbackJournalReaderBase extends Base {
 		 * STEP 2: Cell pointer array scan
 		 ***************************************************************/
 		int last = 0;
+		java.util.Map<Integer, java.util.Map<Integer, Integer>> textLengths = new java.util.HashMap<>();
 		for (int i = 0; i < cp; i++) {
 
 			byte pointer[] = new byte[2];
@@ -401,11 +403,23 @@ public abstract class RollbackJournalReaderBase extends Base {
 
 				output.add(row);
 				/* make the record available through the Job API too */
+				FreeblockReconstructor.addTextLengths(textLengths, row);
 				job.addRow(row);
 			}
 		}
 
 		debug("finished STEP2 -> cellpoint array completed");
+
+		/* deleted records in the freeblocks: reconstructed with the bounds of the freeblocks and the schema */
+		if ((type == 8 || type == 10) && pagenumber_maindb > 0 && pagenumber_maindb < job.pages.length
+				&& job.pages[pagenumber_maindb] instanceof TableDescriptor && (type == 8) == job.pages[pagenumber_maindb].ROWID) {
+			try {
+				FreeblockReconstructor.recoverFreeblocks(ct, buffer, (TableDescriptor) job.pages[pagenumber_maindb], type == 10,
+						textLengths, visit, journalpointer + 4L, RecordSource.ROLLBACK_JOURNAL, job::addRow);
+			} catch (RuntimeException e) {
+				debug("Could not reconstruct the freeblocks of page ", pagenumber_rol, ": ", e);
+			}
+		}
 
 		/***************************************************************
 		 * STEP 3: Scan unallocated space between header and the cell content region

@@ -11,6 +11,7 @@ import fqlite.descriptor.TableDescriptor;
 import fqlite.pattern.SerialTypeMatcher;
 import fqlite.types.CarverTypes;
 import fqlite.util.Auxiliary;
+import fqlite.util.FreeblockReconstructor;
 
 /**
  * This class represents a recovery task. 
@@ -243,6 +244,8 @@ public class RecoveryTask extends Base implements Runnable {
 			 * 
 			 ***************************************************************/
 			int last = 0;
+			/* text lengths of the live records (to reconstruct deleted records of the freeblocks) */
+			java.util.Map<Integer, java.util.Map<Integer, Integer>> textLengths = new java.util.HashMap<>();
 
 			/* go on with the cell pointer array */
 			for (int i = 0; i < cp; i++) {
@@ -297,10 +300,28 @@ public class RecoveryTask extends Base implements Runnable {
 					   /* not reachable from the database structure (e.g. lost schema entry) */
 					   row.setRecordType(Global.UNALLOCATED_SPACE + row.getRecordType());
 					}
+					if (!freeList && !unreferencedPage)
+						FreeblockReconstructor.addTextLengths(textLengths, row);
 					job.addRow(row);
 				}
 
 			} // end of for - cell pointer
+
+			/***************************************************************
+			 * Deleted records in the freeblocks: reconstructed with the exact
+			 * bounds of the freeblocks and the schema of the table
+			 ***************************************************************/
+			if (type == 8 || type == 10) {
+				AbstractDescriptor ad = (pagenumber < job.pages.length) ? job.pages[pagenumber] : null;
+				if (ad instanceof TableDescriptor && (type == 8) == ad.ROWID) {
+					try {
+						FreeblockReconstructor.recoverFreeblocks(ct, buffer, (TableDescriptor) ad, type == 10, textLengths,
+								visit, (long) (pagenumber - 1) * job.ps, RecordSource.DATABASE, job::addRow);
+					} catch (RuntimeException e) {
+						debug("Could not reconstruct the freeblocks of page ", pagenumber, ": ", e);
+					}
+				}
+			}
 
 			
 			/***************************************************************

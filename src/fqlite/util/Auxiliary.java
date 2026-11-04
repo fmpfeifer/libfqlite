@@ -587,6 +587,21 @@ public class Auxiliary extends Base {
 	 * @return a buffer with the data bytes; it is shorter than expected if the overflow chain is broken
 	 * @throws IOException if an I/O error occurs
 	 */
+	/* used by FreeblockReconstructor */
+	ByteBuffer spilledPayload(ByteBuffer page, int datastart, int localdata, int overflowpage, int remaining) throws IOException {
+		return readSpilledPayload(page, datastart, localdata, overflowpage, remaining);
+	}
+
+	/* used by FreeblockReconstructor */
+	int localPayloadSize(int payload, boolean indexPage) {
+		return computePayload(payload, indexPage);
+	}
+
+	/* used by FreeblockReconstructor */
+	Job getJob() {
+		return job;
+	}
+
 	private ByteBuffer readSpilledPayload(ByteBuffer page, int datastart, int localdata, int overflowpage, int remaining)
 			throws IOException {
 		int local = Math.max(0, Math.min(localdata, page.limit() - datastart));
