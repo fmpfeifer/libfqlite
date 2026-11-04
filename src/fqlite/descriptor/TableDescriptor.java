@@ -34,7 +34,7 @@ public class TableDescriptor extends AbstractDescriptor implements Comparable<Ta
 	String signature = ""; // the type signature, i.e., INTSTRINGSTINGINT
 	public String tblname = "";
 	public int root = -1;
-	public boolean ROWID = true; 
+	/* ROWID: inherited from AbstractDescriptor (a field here would hide it) */
     private HeaderPattern hpattern = null;	
 	public boolean virtual = false;
 	public String modulname = null;
