@@ -44,6 +44,43 @@ public class RecoveryStrategiesTest {
         return "msg-" + i + "- " + TestSupport.repeat((char) ('a' + i % 26), len);
     }
 
+    /** Ids of the markers still present in the raw bytes of the files. */
+    static Set<Integer> markersInFiles(Path... files) throws Exception {
+        Set<Integer> ids = new HashSet<>();
+        for (Path f : files) {
+            Matcher m = MARKER.matcher(new String(Files.readAllBytes(f), java.nio.charset.StandardCharsets.ISO_8859_1));
+            while (m.find()) {
+                ids.add(Integer.parseInt(m.group(1)));
+            }
+        }
+        return ids;
+    }
+
+    /** Freelist trunk pages hold the freelist only in their first bytes, the rest is former content. */
+    @Test
+    public void freelistTrunkPages() throws Exception {
+        Path db = TestSupport.createDb(tmp.getRoot().toPath(), "trunk.db", c -> {
+            TestSupport.exec(c, "PRAGMA secure_delete=OFF", "CREATE TABLE msgs(id INTEGER PRIMARY KEY, ts INTEGER, body TEXT)");
+            c.setAutoCommit(false);
+            for (int i = 1; i <= 3000; i++) {
+                TestSupport.exec(c, "INSERT INTO msgs VALUES(" + i + ", " + i + ", '" + body(i, 10 + (i * 31) % 290) + "')");
+            }
+            c.commit();
+            c.setAutoCommit(true);
+            TestSupport.exec(c, "DELETE FROM msgs WHERE id BETWEEN 1000 AND 2000");
+        });
+        Set<Integer> deleted = new HashSet<>();
+        for (int i = 1000; i <= 2000; i++) {
+            deleted.add(i);
+        }
+        Set<Integer> recoverable = markersInFiles(db);
+        recoverable.retainAll(deleted);
+        Job job = TestSupport.run(db);
+        Set<Integer> recovered = markers(job, "msgs", true);
+        recoverable.removeAll(recovered);
+        assertTrue("not recovered: " + recoverable, recoverable.isEmpty());
+    }
+
     /** Pages of a table whose schema entry was destroyed are not referenced by any b-tree. */
     @Test
     public void pagesWithoutSchema() throws Exception {

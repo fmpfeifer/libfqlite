@@ -834,6 +834,16 @@ public class Job extends Base {
 					}
 					freepagesum += entries;
 
+					/* the rest of the trunk page still holds its former content */
+					RecoveryTask trunkTask = new RecoveryTask(aux, this, (long) (trunk - 1) * ps, trunk, ps, true, recoveryTables);
+					trunkTask.setFreelistTrunk(entries);
+					runningTasks.incrementAndGet();
+					if (executor != null) {
+						executor.execute(trunkTask);
+					} else {
+						trunkTask.run();
+					}
+
 					/* is there a further trunk page? */
 					if (nfp <= 0 || nfp > numberofpages) {
 						trunk = 0;

@@ -34,6 +34,8 @@ public class RecoveryTask extends Base implements Runnable {
     private boolean freeList = false;
     /* page which is not referenced by any b-tree of the database nor by the freelist */
     private boolean unreferencedPage = false;
+    /* number of leaf page numbers, if the page is a freelist trunk page (-1 otherwise) */
+    private int trunkEntries = -1;
     
 	/**
 	 * Constructor method.
@@ -76,6 +78,17 @@ public class RecoveryTask extends Base implements Runnable {
 	}
 
 	/**
+	 * Mark the page as freelist trunk page. Only its first bytes are used by the
+	 * freelist (next trunk page, number of leaf pages and the leaf page numbers),
+	 * the rest of the page still holds its former content, which is carved.
+	 * 
+	 * @param entries number of leaf page numbers stored on the trunk page
+	 */
+	public void setFreelistTrunk(int entries) {
+		this.trunkEntries = entries;
+	}
+
+	/**
 	 * This method called to recover regular data records startRegion a database page.
 	 * 
 	 * @return 0 if successful, -1 otherwise.
@@ -92,6 +105,13 @@ public class RecoveryTask extends Base implements Runnable {
 			buffer = job.readPageWithOffset(offset, pagesize);
 			if (buffer == null) {
 			    return -1;
+			}
+
+			if (trunkEntries >= 0) {
+				/* freelist trunk page: skip the freelist data, carve the former content */
+				visit.set(0, Math.min(pagesize, 8 + 4 * trunkEntries));
+				carve(null);
+				return 0;
 			}
 			byte pageType = buffer.get();
 
