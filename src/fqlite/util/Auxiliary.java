@@ -199,6 +199,27 @@ public class Auxiliary extends Base {
 	 */
 	public CarvingResult readDeletedRecord(Job job, int start, ByteBuffer buffer, String header, BitSet bs,
 			int pagenumber) throws IOException {
+		return readDeletedRecord(job, start, buffer, header, bs, pagenumber, buffer.limit());
+	}
+
+	/**
+	 * This method is used to extract a previously deleted record in unused space of a page.
+	 * 
+	 * @param job the job object
+	 * @param start      the exact position (offset relative to the page start).
+	 * @param buffer     a ByteBuffer with the data page to analyze.
+	 * @param header     the record header bytes including header length and serial types.
+	 * @param bs         a data structure that is used to record which areas have already been searched
+	 * @param pagenumber the number of the page we going to analyze
+	 * @param limit      end (exclusive) of the free region the record was found in: a record
+	 *                   exceeding it overlaps other data (it was overwritten) and is rejected
+	 * @return the CarvingResult
+	 * @throws IOException if something went wrong during read-up.
+	 */
+	public CarvingResult readDeletedRecord(Job job, int start, ByteBuffer buffer, String header, BitSet bs,
+			int pagenumber, int limit) throws IOException {
+
+		limit = Math.min(limit, buffer.limit());
 
 		SqliteElement[] columns;
 
@@ -243,10 +264,17 @@ public class Auxiliary extends Base {
 			int localdata = so - phl - 1;
 			int ovfpos = last + localdata;
 			debug(" deleted spilled payload ::", so, " pll ", pll);
-			if (localdata < 0 || ovfpos + 4 > buffer.limit())
+			if (localdata < 0)
 				return null;
 
-			int overflow = buffer.getInt(ovfpos);
+			/* the end of the local part was overwritten: the overflow page number is lost */
+			boolean cut = ovfpos + 4 > limit;
+			if (cut) {
+				localdata = Math.max(0, limit - last);
+				ovfpos = last + localdata - 4;
+				row.setTruncated(true);
+			}
+			int overflow = cut ? 0 : buffer.getInt(ovfpos);
 			debug(" deleted overflow::::::::: ", overflow);
 
 			ByteBuffer bf;
@@ -264,7 +292,14 @@ public class Auxiliary extends Base {
 					row.append(new SqliteElementData(null, job.db_encoding));
 					continue;
 				}
-				byte[] value = BufferUtil.allocateByteBuffer(Math.min(en.length, bf.remaining()));
+				int len = Math.min(en.length, bf.remaining());
+				if (len < en.length)
+					row.setTruncated(true);
+				if (len == 0 && en.length > 0) {
+					row.append(new SqliteElementData(null, job.db_encoding));
+					continue;
+				}
+				byte[] value = BufferUtil.allocateByteBuffer(len);
 				bf.get(value);
 				row.append(new SqliteElementData(en, value));
 			}
@@ -282,10 +317,18 @@ public class Auxiliary extends Base {
 					continue;
 				}
 
-				if ((buffer.position() + en.length) > buffer.limit()) {
-					return null;
+				/*
+				 * the end of the record was overwritten (new data at the end of the free space):
+				 * keep the part in the free region
+				 */
+				int len = Math.min(en.length, Math.max(0, limit - buffer.position()));
+				if (len < en.length)
+					row.setTruncated(true);
+				if (len == 0 && en.length > 0) {
+					row.append(new SqliteElementData(null, job.db_encoding));
+					continue;
 				}
-				byte[] value = BufferUtil.allocateByteBuffer(en.length);
+				byte[] value = BufferUtil.allocateByteBuffer(len);
 				buffer.get(value);
 
 				row.append(new SqliteElementData(en, value));

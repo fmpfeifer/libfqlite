@@ -1624,10 +1624,24 @@ public class Job extends Base {
                 }
             }
         }
+        /* current records by the value of their first column, to detect fragments of copies */
+        Map<String, java.util.TreeMap<String, List<SqliteInternalRow>>> liveByFirst = new HashMap<>();
+        if (!keepCopiesOfLiveRecords && deletedRecords) {
+            for (SqliteInternalRow row : result) {
+                if (!row.isDeletedRow()) {
+                    String first = firstValue(row);
+                    if (first != null)
+                        liveByFirst.computeIfAbsent(row.getTableName(), k -> new java.util.TreeMap<>())
+                                .computeIfAbsent(first, k -> new ArrayList<>()).add(row);
+                }
+            }
+        }
         List<SqliteInternalRow> fromIndices = indexRecovery != null ? indexRecovery.select(result) : Collections.emptyList();
         indexRecovery = null;
         for (SqliteInternalRow row : result) {
             if (!live.isEmpty() && row.isDeletedRow() && isCopyOfLiveRecord(row, live))
+                continue;
+            if (row.isTruncated() && row.isDeletedRow() && isFragmentOfLiveRecord(row, liveByFirst.get(row.getTableName())))
                 continue;
             addRowNow(row);
         }
@@ -1659,6 +1673,67 @@ public class Job extends Base {
             h = hash(h, d);
         }
         return values < 2 ? NO_KEY : h;
+    }
+
+    private int aliasColumn(String table) {
+        TableDescriptor td = headers.get(table);
+        return (td != null && td.rowidcolumn != null) ? td.columnnames.indexOf(td.rowidcolumn) : -1;
+    }
+
+    /** Text of a value to compare (decoded text for strings, raw bytes otherwise), null for NULL. */
+    private static String compareValue(SqliteElementData d) {
+        if (d == null)
+            return null;
+        Object o = d.getObject(false);
+        if (o == null)
+            return null;
+        return o instanceof String ? (String) o : "\u0001" + d.rawKey();
+    }
+
+    /** Value of the first column (without the rowid alias), null if NULL. */
+    private String firstValue(SqliteInternalRow row) {
+        int alias = aliasColumn(row.getTableName());
+        List<SqliteElementData> data = row.getRowData();
+        int first = (alias == 0) ? 1 : 0;
+        return first < data.size() ? compareValue(data.get(first)) : null;
+    }
+
+    /**
+     * A truncated deleted record (its end was overwritten) whose values are the values of
+     * a current record, the last value being cut: a fragment of a former copy of the record.
+     */
+    private boolean isFragmentOfLiveRecord(SqliteInternalRow row, java.util.TreeMap<String, List<SqliteInternalRow>> live) {
+        if (live == null)
+            return false;
+        String first = firstValue(row);
+        if (first == null)
+            return false;
+        /* the first value itself may be cut: all current records starting with it */
+        for (List<SqliteInternalRow> candidates : live.subMap(first, true, first + "￿", true).values()) {
+            for (SqliteInternalRow c : candidates) {
+                if (matchesTruncated(row, c))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesTruncated(SqliteInternalRow fragment, SqliteInternalRow current) {
+        int alias = aliasColumn(fragment.getTableName());
+        List<SqliteElementData> a = fragment.getRowData(), b = current.getRowData();
+        int values = 0;
+        for (int i = 0; i < a.size() && i < b.size(); i++) {
+            if (i == alias)
+                continue;
+            String x = compareValue(a.get(i));
+            if (x == null)
+                continue; /* lost */
+            String y = compareValue(b.get(i));
+            if (y == null || !(x.equals(y) || y.startsWith(x)))
+                return false;
+            values++;
+        }
+        return values > 0;
     }
 
     /** A deleted record with the values of a current record (and the same rowid, if it is known). */
