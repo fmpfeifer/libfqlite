@@ -1638,10 +1638,17 @@ public class Job extends Base {
         }
         List<SqliteInternalRow> fromIndices = indexRecovery != null ? indexRecovery.select(result) : Collections.emptyList();
         indexRecovery = null;
+        /* the current records first, then the deleted ones (users may keep the first record of a key) */
         for (SqliteInternalRow row : result) {
-            if (!live.isEmpty() && row.isDeletedRow() && isCopyOfLiveRecord(row, live))
+            if (!row.isDeletedRow())
+                addRowNow(row);
+        }
+        for (SqliteInternalRow row : result) {
+            if (!row.isDeletedRow())
                 continue;
-            if (row.isTruncated() && row.isDeletedRow() && isFragmentOfLiveRecord(row, liveByFirst.get(row.getTableName())))
+            if (!live.isEmpty() && isCopyOfLiveRecord(row, live))
+                continue;
+            if (row.isTruncated() && isFragmentOfLiveRecord(row, liveByFirst.get(row.getTableName())))
                 continue;
             addRowNow(row);
         }
