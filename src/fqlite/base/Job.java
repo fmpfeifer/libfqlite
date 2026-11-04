@@ -1085,7 +1085,7 @@ public class Job extends Base {
 		finally {
 			if (executor != null) {
 				if (!executor.isTerminated()) {
-					System.err.println("cancel non-finished tasks");
+					getLogger().error("cancel non-finished tasks");
 				}
 				executor.shutdownNow();
 				info("shutdown finished");
@@ -1150,7 +1150,8 @@ public class Job extends Base {
 			try {
 				run(path);
 			} catch (Exception e) {
-				e.printStackTrace();
+				/* always reported (independent of LOGLEVEL), like the stack trace printed before */
+				getLogger().error("Error while processing " + path, e);
 			}
 		else
 			return;
@@ -1178,7 +1179,8 @@ public class Job extends Base {
 		try {
 			hashcode = processDB();
 		} catch (InterruptedException | ExecutionException | IOException e) {
-			e.printStackTrace();
+			/* always reported (independent of LOGLEVEL), like the stack trace printed before */
+			getLogger().error("Error while processing " + p, e);
 		}
 		long end = System.currentTimeMillis();
 		info("Duration in ms: ", (end - start));
@@ -1375,7 +1377,7 @@ public class Job extends Base {
             }
             
         } catch (IOException e) {
-            e.printStackTrace();
+            getLogger().error("Could not write the results to " + filename, e);
         }
 
     }

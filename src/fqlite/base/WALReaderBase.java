@@ -717,7 +717,7 @@ public abstract class WALReaderBase extends Base {
 		carve(null);
 		
 	} catch (Exception err) {
-		err.printStackTrace();
+		getLogger().error("Error while carving WAL frame " + frame.framenumber, err);
 		return -1;
 	}
 
