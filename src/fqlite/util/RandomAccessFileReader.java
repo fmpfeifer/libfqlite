@@ -30,7 +30,9 @@ public class RandomAccessFileReader extends LongPositionByteBuffer {
     }
 
     public long position() {
-        return position;
+        synchronized (lock) {
+            return position;
+        }
     }
 
     public long position(long newPosition) throws IOException {
@@ -47,14 +49,18 @@ public class RandomAccessFileReader extends LongPositionByteBuffer {
 
     public byte get() throws IOException {
         synchronized (lock) {
-            if (position > size) {
+            if (position >= size) {
                 throw new BufferUnderflowException();
             }
-            if (buffer.remaining() == 0) {
+            /* the buffer always holds the block of the current position (see fillBuffer) */
+            if (!buffer.hasRemaining()) {
                 fillBuffer();
+                if (!buffer.hasRemaining()) {
+                    throw new BufferUnderflowException();
+                }
             }
             byte resp = buffer.get();
-            position(position + 1);
+            position++;
             return resp;
         }
     }

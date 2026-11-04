@@ -774,7 +774,8 @@ public class Auxiliary extends Base {
 			buffer.get(header);
 
 		} catch (Exception err) {
-			err("ERROR ", err);
+			/* expected while carving: the assumed header exceeds the page */
+			debug("getHeaderString(): ", err);
 		}
 
 		String sheader = bytesToHex(header);
@@ -801,7 +802,8 @@ public class Auxiliary extends Base {
 			buffer.get(header);
 
 		} catch (Exception err) {
-			err("Auxiliary::ERROR ", err);
+			/* expected while carving: the assumed header exceeds the page */
+			debug("getColumns(): ", err);
 			return null;
 		}
 

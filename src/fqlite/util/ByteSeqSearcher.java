@@ -70,34 +70,51 @@ public class ByteSeqSearcher{
 	     */
 	    public long indexOf(LongPositionByteBuffer file) throws IOException
 	    {
-	    	//int size = buffer.capacity() - buffer.position();
-	        
-	        int b;
 	        int j = 0;
-
-	        while (file.position() < file.size())
+	        long pos = file.position();
+	        long size = file.size();
+	        if (pos >= size || pattern_.length == 0)
 	        {
-	            b = file.get();
-	         
-	            while (j >= 0 && (byte) b != pattern_[j])
-	            {
-	                j = borders_[j];
-	            }
-	            // Move to the next character in the pattern.
-	            ++j;
+	            return -1;
+	        }
 
-	            // If we've matched up to the full pattern length, we found it.  Return,
-	            // which will automatically save our position in the Input-Buffer at the point immediately
-	            // following the pattern match.
-	            if (j == pattern_.length)
+	        /* read the input in blocks - reading byte by byte is very slow for files */
+	        byte[] chunk = new byte[(int) Math.min(CHUNK_SIZE, size - pos)];
+
+	        while (pos < size)
+	        {
+	            int len = (int) Math.min(chunk.length, size - pos);
+	            file.position(pos);
+	            file.get(chunk, 0, len);
+
+	            for (int k = 0; k < len; k++)
 	            {
-	                return file.position();
+	                byte b = chunk[k];
+	                while (j >= 0 && b != pattern_[j])
+	                {
+	                    j = borders_[j];
+	                }
+	                // Move to the next character in the pattern.
+	                ++j;
+
+	                // If we've matched up to the full pattern length, we found it. Return
+	                // the position immediately following the pattern match (the input is
+	                // positioned there too).
+	                if (j == pattern_.length)
+	                {
+	                    long end = pos + k + 1;
+	                    file.position(end);
+	                    return end;
+	                }
 	            }
+	            pos += len;
 	        }
 
 	        // No dice, Note that the buffer is now completely consumed.
 	        return -1;
 	    }
+
+	    private static final int CHUNK_SIZE = 65536;
 
 	    /**
 	     * Builds up a component of longest "borders" for each prefix of the pattern to find. 
