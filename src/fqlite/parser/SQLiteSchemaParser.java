@@ -97,17 +97,17 @@ public class SQLiteSchemaParser {
 		/* the component name and columns are extracted here */
 		TableParser p = new TableParser();
 
-		if (sql.contains("CREATE TABLE"))
+		if (sql.contains("CREATE TABLE") || sql.contains("CREATE VIRTUAL TABLE"))
 		{
 			TableDescriptor tds = p.parseCREATETABLEStatement(sql);
 				
 			if (null != tds) {
-			    /* save link to this component object within the virtual component list */
-	            if (tds.isVirtual())
-	                job.virtualTables.put(tds.tblname, tds);
-	            
 				Logger.out.debug(tds.getStandardPattern().toString());
 				tds.tblname = tablename;
+			    /* save link to this component object within the virtual component list */
+	            if (tds.isVirtual() && !job.virtualTables.containsKey(tablename))
+	                job.virtualTables.put(tablename, tds);
+
 				tds.ROWID = rowid;  // this flag indicates weather there is a ROWID or not 
 				/* avoid double entries */
 				if (!job.headers.containsKey(tablename))

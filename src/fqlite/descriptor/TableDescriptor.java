@@ -183,13 +183,11 @@ public class TableDescriptor extends AbstractDescriptor implements Comparable<Ta
 		/* find the primary key by checking the column constraint */ 
 		for(int i=0; i < names.size(); i++)
 		{
-			if (null != constraints)
-				info("tblname: " + tblname);
-			
 			if (tblname.equals("__UNASSIGNED"))
 				break;
-				/* we look for the keyword PRIMARYKEY */
-				if (constraints.get(i).contains("PRIMARYKEY"))
+				/* we look for the keyword PRIMARYKEY (virtual tables have no constraints) */
+				if (null != constraints && i < constraints.size() && null != constraints.get(i)
+						&& constraints.get(i).contains("PRIMARYKEY"))
 				{
 					this.primarykeycolumns.add(names.get(i));
 				}

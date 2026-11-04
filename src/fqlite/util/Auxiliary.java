@@ -153,7 +153,8 @@ public class Auxiliary extends Base {
 				else {
 					/* the root page can be stored with any integer serial type (1 to 4 bytes) */
 					long root = new SqliteElementData(en, value).getIntValue();
-					if (root > 0 && root <= Integer.MAX_VALUE)
+					/* virtual tables have root page 0 */
+					if (root >= 0 && root <= Integer.MAX_VALUE)
 						rootpage = (int) root;
 				}
 			}

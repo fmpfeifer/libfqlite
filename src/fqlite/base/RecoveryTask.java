@@ -236,76 +236,9 @@ public class RecoveryTask extends Base implements Runnable {
 				// add new line to output
 				if (null != row) {
 					
-					int p;
-					String tableName = row.getTableName();
-					if ((p = tableName.indexOf("_node;")) > 0)
-					{
-						String tbln = tableName.substring(0, p);
-						
-						if (job.virtualTables.containsKey(tbln))
-						{
-							TableDescriptor tds = job.virtualTables.get(tbln);
-							
-							/* we use the xxx_node shadow component to construct the 
-							 * virtual component
-							 */
-							//String BLOB = tableName.substring(p);
-							//System.out.println(BLOB);
-							
-							/* skip the first information -> go directly to the 5th element
-							 * of the data record line, i.e. go to the BLOB with the row data
-							 */
-							//int pp = Auxiliary.findNthOccur(rc, ';', 4);
-							//String data = rc.substring(pp+1);
-
-							String data = row.getRowData().get(1).toString();
-						
-							/* transform String data into an byte array */
-							byte[] binary = Auxiliary.decode(data);
-							ByteBuffer bf = ByteBuffer.wrap(binary);
-                            
-							/* skip the first to bytes */
-							bf.getShort();
-							/* first get the total number of entries for this rtree branch */
-                            int entries = bf.getShort();
-					
-                            /* create a new line for every data row */ 
-                            while(entries>0)
-                            {
-                                SqliteInternalRow vrow = new SqliteInternalRow();
-                                vrow.setTableName(tbln);
-                                vrow.setRecordType("VT");
-                                vrow.setOffset(0);
-    					
-                            	// The first column is always a 64-bit signed integer primary key.
-                            	long primarykey = bf.getLong();
-                                vrow.append(new SqliteElementData(primarykey, job.db_encoding));
-                            	
-                            	//Each R*Tree indices is a virtual component with an odd number of columns between 3 and 11
-                            	//The other columns are pairs, one pair per dimension, containing the minimum and maximum values for that dimension, respectively.
-                            	int number = tds.columnnames.size() - 1;
-                            	
-                            	while (number > 0)
-                            	{	
-	                            	float rv = bf.getFloat();
-	                                vrow.append(new SqliteElementData(rv, job.db_encoding));
-	                            	number--;
-                            	}
-
-
-	                            //vrow.append("\n");
-                                //job.ll.add(vrow.toString());
-                                job.addRow(vrow);
-
-    							info(vrow.toString());
-
-    							entries--;
-
-                            }	
-
-
-						}
-
+					/* R*Tree virtual table: decode the entries of the shadow node table */
+					for (SqliteInternalRow vrow : RTreeDecoder.decode(job, row)) {
+					    job.addRow(vrow);
 					}
 					
 					/* if record resides inside a free page -> add a flag char to document this */

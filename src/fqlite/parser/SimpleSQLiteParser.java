@@ -198,7 +198,7 @@ public class SimpleSQLiteParser extends Base {
         		info(" arg " + modulargument);
         		
         		/* RTree Modul ?*/
-        		if(modulname.equals("rtree"))
+        		if("rtree".equalsIgnoreCase(modulname) || "rtree_i32".equalsIgnoreCase(modulname))
         		{
         			colnames.add(modulargument);
         			
