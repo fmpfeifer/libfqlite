@@ -137,6 +137,10 @@ public class RecoveryTask extends Base implements Runnable {
 				info("Index leaf page ", pagenumber);	
 				// note: WITHOUT ROWID tables are saved here.
 				withoutROWID=true;
+			} else if (type == 2) {
+				/* interior pages of index b-trees hold records too (e.g. of WITHOUT ROWID tables) */
+				info("Index interior page ", pagenumber);
+				withoutROWID=true;
 			} else {
 				info("Data page ", pagenumber, " Offset: ", offset);
 
@@ -183,7 +187,9 @@ public class RecoveryTask extends Base implements Runnable {
 			ByteBuffer size = ByteBuffer.wrap(cpn);
 			int cp = Auxiliary.TwoByteBuffertoInt(size);
 			/* the cell pointer array can not be larger than the page (corrupted page) */
-			cp = Math.min(cp, (pagesize - 8) / 2);
+			/* interior pages have a 12 byte header (with the right most child pointer) */
+			int pageheader = (type == 2) ? 12 : 8;
+			cp = Math.min(cp, (pagesize - pageheader) / 2);
 			/* a value of zero means 65536 */
 			if (ccrstart == 0)
 				ccrstart = 65536;
@@ -193,7 +199,7 @@ public class RecoveryTask extends Base implements Runnable {
 			if (0 == cp)
 				debug(" Page seems to be dropped. No cell entries.");
 
-			int headerend = 8 + (cp * 2);
+			int headerend = pageheader + (cp * 2);
 			visit.set(0, headerend);
 			//System.out.println("headerend:" + headerend);
 
@@ -210,10 +216,7 @@ public class RecoveryTask extends Base implements Runnable {
 
 				// address of the next cell pointer
 				byte pointer[] = new byte[2];
-				if (type == 5)
-					buffer.position(12+2*i);
-				else
-					buffer.position(8+2*i);
+				buffer.position(pageheader + 2 * i);
 				buffer.get(pointer);
 				ByteBuffer celladdr = ByteBuffer.wrap(pointer);
 				int celloff = Auxiliary.TwoByteBuffertoInt(celladdr);
@@ -228,9 +231,13 @@ public class RecoveryTask extends Base implements Runnable {
 				SqliteInternalRow row = null;
 				
 				/* small cells can be located in the very last bytes of the page */
-				if (celloff > 0 && celloff < buffer.limit()) {
+				/* cells of interior index pages start with the 4 byte page number of the left child */
+				int recordstart = (type == 2) ? celloff + 4 : celloff;
+				if (celloff > 0 && recordstart < buffer.limit()) {
 				    try {
-				        row = ct.readRecord(celloff, buffer, pagenumber, visit, type, Integer.MAX_VALUE, firstcol,withoutROWID,-1);
+				        if (type == 2)
+				            visit.set(celloff, recordstart);
+				        row = ct.readRecord(recordstart, buffer, pagenumber, visit, type, Integer.MAX_VALUE, firstcol,withoutROWID,-1);
 				    } catch (RuntimeException e) {
 				        /* corrupted cell - skip it */
 				        debug("Could not read cell at offset ", celloff, " of page ", pagenumber, ": ", e);

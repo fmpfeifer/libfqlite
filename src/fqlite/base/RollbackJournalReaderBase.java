@@ -271,6 +271,14 @@ public abstract class RollbackJournalReaderBase extends Base {
 	 *
 	 * @return int success
 	 */
+	private boolean isWithoutRowidTablePage(int pagenumber) {
+		if (pagenumber > 0 && pagenumber < job.pages.length) {
+			AbstractDescriptor ad = job.pages[pagenumber];
+			return ad instanceof TableDescriptor && !ad.ROWID;
+		}
+		return false;
+	}
+
 	public int analyzePage() {
 
 		withoutROWID = false;
@@ -314,6 +322,13 @@ public abstract class RollbackJournalReaderBase extends Base {
 			info("Index leaf page ", pagenumber_rol);
 			// note: WITHOUT ROWID tables are saved here.
 			withoutROWID = true;
+		} else if (type == 2) {
+			/* interior pages of index b-trees: only the ones of WITHOUT ROWID tables hold table records */
+			if (!isWithoutRowidTablePage(pagenumber_maindb)) {
+				info("Index interior page ", pagenumber_rol);
+				return -1;
+			}
+			withoutROWID = true;
 		} else {
 			info("Data page ", pagenumber_rol, " Offset: ", (journalpointer + 4));
 		}
@@ -337,11 +352,13 @@ public abstract class RollbackJournalReaderBase extends Base {
 
 		int cp = Auxiliary.TwoByteBuffertoInt(cpn);
 		/* the cell pointer array can not be larger than the page (corrupted page) */
-		cp = Math.min(cp, (ps - 8) / 2);
+		/* interior pages have a 12 byte header (with the right most child pointer) */
+		int pageheader = (type == 2) ? 12 : 8;
+		cp = Math.min(cp, (ps - pageheader) / 2);
 		debug(" number of cells: ", cp, " type of page ", type);
 		job.numberofcells.addAndGet(cp);
 
-		int headerend = 8 + (cp * 2);
+		int headerend = pageheader + (cp * 2);
 		visit.set(0, headerend);
 
 		/***************************************************************
@@ -351,7 +368,7 @@ public abstract class RollbackJournalReaderBase extends Base {
 		for (int i = 0; i < cp; i++) {
 
 			byte pointer[] = new byte[2];
-			buffer.position(8 + 2 * i);
+			buffer.position(pageheader + 2 * i);
 			buffer.get(pointer);
 			int celloff = Auxiliary.TwoByteBuffertoInt(pointer);
 
@@ -361,9 +378,13 @@ public abstract class RollbackJournalReaderBase extends Base {
 			last = celloff;
 
 			SqliteInternalRow row = null;
-			if (celloff > 0 && celloff < buffer.limit()) {
+			/* cells of interior index pages start with the 4 byte page number of the left child */
+			int recordstart = (type == 2) ? celloff + 4 : celloff;
+			if (celloff > 0 && recordstart < buffer.limit()) {
+				if (type == 2)
+					visit.set(celloff, recordstart);
 				try {
-					row = ct.readRecord(celloff, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID, journalpointer + 4);
+					row = ct.readRecord(recordstart, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID, journalpointer + 4);
 				} catch (IOException | RuntimeException e) {
 					debug("Could not read cell at offset ", celloff, " of journal page ", pagenumber_rol, ": ", e);
 				}

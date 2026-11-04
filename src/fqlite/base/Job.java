@@ -697,7 +697,7 @@ public class Job extends Base {
 				exploreBTree(td.getRootOffset(), pageNumber -> { 
                         if (null == pages[pageNumber])
                             pages[pageNumber] = td;
-                    }
+                    }, !td.ROWID
                 );
 
 			}
@@ -1240,6 +1240,20 @@ public class Job extends Base {
      * @throws IOException ioException
      */
     private void exploreBTree(int rootPage, BTreePageVisitor visitor) throws IOException {
+        exploreBTree(rootPage, visitor, false);
+    }
+
+    /**
+     * Traverse a b-tree.
+     * 
+     * @param rootPage      the page number of the root page
+     * @param visitor       visitor to act on leaf pages
+     * @param indexInterior true to descend into interior pages of index b-trees and to visit them too:
+     *                      the b-tree of a WITHOUT ROWID table is an index b-tree, its interior pages
+     *                      hold records as well
+     * @throws IOException ioException
+     */
+    private void exploreBTree(int rootPage, BTreePageVisitor visitor, boolean indexInterior) throws IOException {
 
         Deque<Integer> stack = new ArrayDeque<>();
         Set<Integer> visited = new HashSet<>();
@@ -1260,9 +1274,11 @@ public class Job extends Base {
             /* check type of the page by reading the first byte */
             int typ = Auxiliary.getPageType(buffer.get(pageHeaderOffset));
 
-            if (typ == 12 || typ == 2) {
+            if (typ == 12 || (typ == 2 && indexInterior)) {
                 /* interior page of a table (12) or of an index (2) */
                 debug("page number ", pageNumber, " is an interior page ");
+                if (typ == 2)
+                    visitor.visitLeafPage(pageNumber);
 
                 int e = buffer.getShort(pageHeaderOffset + 3) & 0xFFFF;
                 List<Integer> children = new ArrayList<>();

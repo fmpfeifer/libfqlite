@@ -67,6 +67,8 @@ public class SimpleSQLiteParser extends Base {
 	List<String> colconstraints = new ArrayList<String>();
 	List<String> colnames = new ArrayList<String>();
 	List<String> tableconstraint = new ArrayList<String>();
+	/* indices of the columns without a (known) type name */
+	java.util.Set<Integer> untypedColumns = new java.util.HashSet<Integer>();
 	Map<Integer,String> constraints = new HashMap<Integer,String>();
 	HeaderPattern pattern = new HeaderPattern();
 
@@ -409,8 +411,10 @@ public class SimpleSQLiteParser extends Base {
 	        		info("SQLType::" + value);
 	        		String type = getType(value);
 	        		/* SQLite: a type name without any of the known key words has NUMERIC affinity */
-	        		if (type.length() == 0)
+	        		if (type.length() == 0) {
 	        			type = "NUMERIC";
+	        			untypedColumns.add(coltypes.size());
+	        		}
 	        		coltypes.add(type);
 	        		typeSeen = true;
 	        		info("Typename " + trim(type));
@@ -458,11 +462,12 @@ public class SimpleSQLiteParser extends Base {
         	{ 
         		/*
         		 * a column without type name - keep the type lists aligned with the column names.
-        		 * Such a column can hold values of any type -> NUMERIC (matches every serial type)
+        		 * Such a column can hold values of any type -> NUMERIC affinity
         		 */
         		if (inColumnDef && !typeSeen)
         		{
         			sqltypes.add("");
+        			untypedColumns.add(coltypes.size());
         			coltypes.add("NUMERIC");
         		}
         		inColumnDef = false;
@@ -495,8 +500,17 @@ public class SimpleSQLiteParser extends Base {
         		ListIterator<String> list = coltypes.listIterator();
         		while(list.hasNext())
         		{	
+        			String coltype = list.next();
+        			/*
+        			 * columns without (known) type can hold any value - a constraint matching
+        			 * everything would turn the table into a wildcard for carving
+        			 */
+        			if (untypedColumns.contains(cc)) {
+        				cc++;
+        				continue;
+        			}
         		
-	        		switch (list.next()) {
+	        		switch (coltype) {
 					case "INT":
 						if (constraints.containsKey(cc))
 							pattern.add(new IntegerConstraint(true));

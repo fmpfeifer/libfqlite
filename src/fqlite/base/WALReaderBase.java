@@ -426,6 +426,14 @@ public abstract class WALReaderBase extends Base {
 	 * @param frame the WALFrame object
 	 * @return int success
 	 */
+	private boolean isWithoutRowidTablePage(int pagenumber) {
+		if (pagenumber > 0 && pagenumber < job.pages.length) {
+			AbstractDescriptor ad = job.pages[pagenumber];
+			return ad instanceof TableDescriptor && !ad.ROWID;
+		}
+		return false;
+	}
+
 	public int analyzePage(WALFrame frame) {
 		
 		withoutROWID = false;
@@ -493,6 +501,13 @@ public abstract class WALReaderBase extends Base {
 			info("Index leaf page ", pagenumber_wal);
 			// note: WITHOUT ROWID tables are saved here.
 			withoutROWID = true;
+		} else if (type == 2) {
+			/* interior pages of index b-trees: only the ones of WITHOUT ROWID tables hold table records */
+			if (!isWithoutRowidTablePage(pagenumber_maindb)) {
+				info("Index interior page ", pagenumber_wal);
+				return -1;
+			}
+			withoutROWID = true;
 		} else {
 			info("Data page ", pagenumber_wal, " Offset: ", (file.position()));
 		}
@@ -534,14 +549,16 @@ public abstract class WALReaderBase extends Base {
 		ByteBuffer size = ByteBuffer.wrap(cpn);
 		int cp = Auxiliary.TwoByteBuffertoInt(size);
 		/* the cell pointer array can not be larger than the page (corrupted page) */
-		cp = Math.min(cp, (ps - 8) / 2);
+		/* interior pages have a 12 byte header (with the right most child pointer) */
+		int pageheader = (type == 2) ? 12 : 8;
+		cp = Math.min(cp, (ps - pageheader) / 2);
 
 		debug(" number of cells: ", cp, " type of page ", type);
 		job.numberofcells.addAndGet(cp);
 		if (0 == cp)
 			debug(" Page seems to be dropped. No cell entries.");
 
-		int headerend = 8 + (cp * 2);
+		int headerend = pageheader + (cp * 2);
 		visit.set(0, headerend);
 		info("headerend:", headerend);
 
@@ -558,10 +575,7 @@ public abstract class WALReaderBase extends Base {
 
 			// address of the next cell pointer
 			byte pointer[] = new byte[2];
-			if (type == 5)
-				buffer.position(12 + 2 * i);
-			else
-				buffer.position(8 + 2 * i);
+			buffer.position(pageheader + 2 * i);
 			buffer.get(pointer);
 			ByteBuffer celladdr = ByteBuffer.wrap(pointer);
 			int celloff = Auxiliary.TwoByteBuffertoInt(celladdr);
@@ -575,9 +589,13 @@ public abstract class WALReaderBase extends Base {
 			
 			SqliteInternalRow row = null;
 
-			if (celloff > 0 && celloff < buffer.limit()) {
+			/* cells of interior index pages start with the 4 byte page number of the left child */
+			int recordstart = (type == 2) ? celloff + 4 : celloff;
+			if (celloff > 0 && recordstart < buffer.limit()) {
+				if (type == 2)
+					visit.set(celloff, recordstart);
 				try {
-					row = ct.readRecord(celloff, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID,framestart+24);
+					row = ct.readRecord(recordstart, buffer, pagenumber_maindb, visit, type, Integer.MAX_VALUE, firstcol, withoutROWID,framestart+24);
 				} catch (IOException | RuntimeException e) {
 					debug("Could not read cell at offset ", celloff, " of WAL frame ", frame.framenumber, ": ", e);
 				}

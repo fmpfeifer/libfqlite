@@ -31,6 +31,15 @@ public class SchemaParserTest {
         assertEquals("id", td.rowidcolumn);
     }
 
+    /** Columns without type are not part of the carving pattern (they would match any record). */
+    @Test
+    public void untypedColumnsAreNotPartOfTheCarvingPattern() {
+        /* only the header constraint */
+        assertEquals(1, table("CREATE TABLE sqlite_sequence(name,seq)").getHpattern().size());
+        /* header constraint + TEXT */
+        assertEquals(2, table("CREATE TABLE t(a, b TEXT)").getHpattern().size());
+    }
+
     @Test
     public void integerPrimaryKeyIsRowidAlias() {
         assertEquals("id", table("CREATE TABLE t(name TEXT, id INTEGER PRIMARY KEY)").rowidcolumn);

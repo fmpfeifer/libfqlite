@@ -341,6 +341,9 @@ public class Auxiliary extends Base {
 		// prepare the string for the return value
 		SqliteInternalRow row = new SqliteInternalRow();
 
+		/* records in the unallocated space are guesses: their length is limited (maxlength) */
+		boolean guessed = maxlength != Integer.MAX_VALUE;
+
 		/* is the component of this page known? */
 		boolean pageInRange = pagenumber_db >= 0 && pagenumber_db < job.pages.length;
 		AbstractDescriptor known = pageInRange ? job.pages[pagenumber_db] : null;
@@ -475,7 +478,11 @@ public class Auxiliary extends Base {
 
 			/* now we have the complete payload data in one buffer */
 			bf = readSpilledPayload(buffer, buffer.position(), localdata, overflow, pll - so);
-			cellend = ovfpos + 4;
+			/*
+			 * mark the local part of the payload as visited - but not for guessed records in the
+			 * unallocated space: a wrong payload length would hide a large part of the page from carving
+			 */
+			cellend = guessed ? buffer.position() : ovfpos + 4;
 		} else {
 			bf = buffer;
 			cellend = -1;
