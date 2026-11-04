@@ -1383,6 +1383,10 @@ public class Job extends Base {
     }
 
     public void addRow(SqliteInternalRow row) {
+        /* a deleted record with only NULL values holds no information (e.g. carved from zeroed space) */
+        if (row.isDeletedRow() && Auxiliary.isEmptyRow(row)) {
+            return;
+        }
         row.setColumnNamesMap(getColIdxMapForTable(row.getTableName()));
 		if (recoverOnlyDeletedRecords) {
 			// only add rows that are marked as deleted

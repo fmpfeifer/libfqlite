@@ -46,6 +46,25 @@ public class BasicRecoveryTest {
         assertTrue("some deleted rows should be recovered", TestSupport.countDeleted(job, "person") > 0);
     }
 
+    /** Space cleaned by secure_delete must not produce (thousands of) empty "deleted" records. */
+    @Test
+    public void noEmptyRecordsFromZeroedSpace() throws Exception {
+        Path db = TestSupport.createDb(tmp.getRoot().toPath(), "secure.db", c -> {
+            TestSupport.exec(c, "PRAGMA secure_delete=ON", "CREATE TABLE msgs(id INTEGER PRIMARY KEY, ts INTEGER, body TEXT)");
+            c.setAutoCommit(false);
+            for (int i = 1; i <= 2000; i++) {
+                TestSupport.exec(c, "INSERT INTO msgs VALUES(" + i + ", " + i + ", 'msg-" + i + "- "
+                        + TestSupport.repeat('x', 10 + i % 190) + "')");
+            }
+            c.commit();
+            c.setAutoCommit(true);
+            TestSupport.exec(c, "DELETE FROM msgs WHERE id % 4 = 0 OR id BETWEEN 1000 AND 1400");
+        });
+        Job job = TestSupport.run(db);
+        assertEquals(1200, TestSupport.countRegular(job, "msgs"));
+        assertEquals(0, TestSupport.countDeleted(job, "msgs"));
+    }
+
     /**
      * Stale cell pointers at the end of the unallocated area must not make the recovery skip the
      * whole cell content area (all freeblocks of the page were lost).

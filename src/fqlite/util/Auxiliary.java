@@ -1178,6 +1178,37 @@ public class Auxiliary extends Base {
 		return fp;
 	}
 
+	/**
+	 * Check if a region of a page holds no information: only zero bytes behind the
+	 * first 4 bytes (which may be the header of a freeblock: next freeblock and size).
+	 * Pages cleaned by secure_delete look like this.
+	 * 
+	 * @param buffer the page
+	 * @param from   first byte of the region
+	 * @param to     last byte of the region (inclusive)
+	 * @return true, if there are only zero bytes
+	 */
+	public static boolean isEmptyArea(ByteBuffer buffer, int from, int to) {
+		int end = Math.min(to, buffer.limit() - 1);
+		for (int index = Math.min(from + 4, end + 1); index <= end; index++) {
+			if (buffer.get(index) != 0)
+				return false;
+		}
+		return true;
+	}
+
+	/**
+	 * @param row a record
+	 * @return true, if all values of the record are NULL (it holds no information)
+	 */
+	public static boolean isEmptyRow(SqliteInternalRow row) {
+		for (SqliteElementData d : row.getRowData()) {
+			if (d != null && d.getObject(false) != null)
+				return false;
+		}
+		return true;
+	}
+
 	public static void printStackTrace() {
 		Logger.out.info("Printing stack trace:");
 

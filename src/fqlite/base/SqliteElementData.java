@@ -120,7 +120,7 @@ public class SqliteElementData {
      * @param convertDateTime whether values that look like timestamps are converted to a date string
      * @return the decoded value
      */
-    Object getObject(boolean convertDateTime) {
+    public Object getObject(boolean convertDateTime) {
         if (data == null) {
             return null;
         }

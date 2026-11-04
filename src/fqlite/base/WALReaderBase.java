@@ -803,14 +803,8 @@ public abstract class WALReaderBase extends Base {
 				if (to - from > 10) {
 
 					/* check for zero bytes */
-					boolean isNull = false;
-					if (buffer.get(from) == 0) {
-						isNull = true;
-						for (int index = from; index < to; index++) {
-							if (0 != buffer.get(index))
-								isNull = false;
-						}
-					}
+					/* only zeros behind a (possible) 4 byte freeblock header: nothing to recover */
+					boolean isNull = Auxiliary.isEmptyArea(buffer, from, to);
 					// skip NULL-Byte areas - mark as visited
 					if (isNull)
 						visit.set(from, to);
