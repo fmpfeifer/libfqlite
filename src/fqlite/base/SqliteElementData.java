@@ -24,7 +24,7 @@ public class SqliteElementData {
         if (null == data) {
             this.data = null;
         } else {
-            this.data = data.getBytes();
+            this.data = data.getBytes(charset);
         }
         this.charset = charset;
     }
@@ -113,8 +113,19 @@ public class SqliteElementData {
     }
     
     public Object getObject() {
+        return getObject(Global.CONVERT_DATETIME);
+    }
+
+    /**
+     * @param convertDateTime whether values that look like timestamps are converted to a date string
+     * @return the decoded value
+     */
+    Object getObject(boolean convertDateTime) {
         if (data == null) {
             return null;
+        }
+        if (column == null) {
+            return SqliteElement.decodeString(data, charset).toString();
         }
         if (data.length == 0 && column.type != SerialTypes.INT0 && column.type != SerialTypes.INT1) {
             return null;
@@ -143,7 +154,7 @@ public class SqliteElementData {
                 } else {
                     lValue = SqliteElement.decodeInt64(data);
                 }
-                if (Global.CONVERT_DATETIME) {
+                if (convertDateTime) {
                     String strDateTime = DatetimeConverter.isUnixEpoch(lValue);
                     if (null != strDateTime)
                     {
@@ -153,7 +164,7 @@ public class SqliteElementData {
                 return lValue;
             case FLOAT64:
                 double dValue = SqliteElement.decodeFloat64(data);
-                if (Global.CONVERT_DATETIME) {
+                if (convertDateTime) {
                     String strDateTime = DatetimeConverter.isMacAbsoluteTime(dValue);
                     if (null != strDateTime) {
                         return strDateTime;

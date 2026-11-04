@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Hashtable;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -383,15 +384,13 @@ public class Job extends Base {
 			info("Maximum embedded payload fraction. Must be 64.", maxpayloadfrac);
 
 			minpayloadfrac = buffer.get();
-			info("Minimum embedded payload fraction. Must be 32.", maxpayloadfrac);
+			info("Minimum embedded payload fraction. Must be 32.", minpayloadfrac);
 
 			leafpayloadfrac = buffer.get();
 			info("Leaf payload fraction. Must be 32.  ", leafpayloadfrac);
 
-			buffer.position(16);
-			inheaderdbsize = Integer.toUnsignedLong(buffer.getInt());
-			if (inheaderdbsize == 1)
-				inheaderdbsize = 65536;
+			/* offset 28: size of the database file in pages (the "in-header database size") */
+			inheaderdbsize = Integer.toUnsignedLong(buffer.getInt(28));
 			
 			buffer.position(24);
 			filechangecounter = Integer.toUnsignedLong(buffer.getInt());
@@ -438,11 +437,12 @@ public class Job extends Base {
 			
 			buffer.position(52);
 			avacc = Integer.toUnsignedLong(buffer.getInt());
+			/* largest root b-tree page: non-zero in auto-vacuum or incremental-vacuum mode */
 			if (avacc == 0) {
 				info("Seems to be no AutoVacuum db. Nice :-).");
-				autovacuum = true;
-			} else
 				autovacuum = false;
+			} else
+				autovacuum = true;
 
 			/********************************************************************/
 			// Determine database text encoding.
@@ -1317,6 +1317,8 @@ public class Job extends Base {
             filename = "results" + name + date + ".csv";
         }
         
+        /* do not change the order of the array of the caller */
+        lines = Arrays.copyOf(lines, lines.length);
         Arrays.sort(lines);
 
         /** convert line to UTF-8 **/
@@ -1325,7 +1327,8 @@ public class Job extends Base {
             final File file = new File(filename);
             
             
-            try (final BufferedWriter writer = Files.newBufferedWriter(file.toPath(),Charset.forName("UTF-8"), StandardOpenOption.CREATE)) 
+            try (final BufferedWriter writer = Files.newBufferedWriter(file.toPath(),StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) 
             {
               for (String line: lines)
               { 
@@ -1357,7 +1360,7 @@ public class Job extends Base {
             }
             SqliteRow decoded = row.decodeRow();
             decoded.setCharset(db_encoding);
-            tables.add(row.decodeRow());
+            tables.add(decoded);
 		}
     }
 
@@ -1367,13 +1370,14 @@ public class Job extends Base {
 
     public List<SqliteRow> getRowsForTable(String tableName) {
         synchronized (lock) {
-            return tableRows.getOrDefault(tableName, Collections.emptyList());
+            /* a copy - the recovery may still add rows (WAL/journal readers, worker threads) */
+            return new ArrayList<>(tableRows.getOrDefault(tableName, Collections.emptyList()));
         }
     }
 
     public synchronized Set<String> getTablesNames() {
         synchronized (lock) {
-            return tableRows.keySet();
+            return new LinkedHashSet<>(tableRows.keySet());
         }
     }
     

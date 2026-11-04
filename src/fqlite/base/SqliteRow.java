@@ -60,6 +60,20 @@ public class SqliteRow {
         this.rowData = rowData;
     }
 
+    /* numeric values of the columns that were converted to a date string (or null) */
+    private Object[] rawData = null;
+
+    void setRawData(Object[] rawData) {
+        this.rawData = rawData;
+    }
+
+    private Object rawValue(int colIdx) {
+        if (rawData != null && colIdx >= 0 && colIdx < rawData.length) {
+            return rawData[colIdx];
+        }
+        return null;
+    }
+
     
     public String getTableName() {
         return tableName;
@@ -84,6 +98,7 @@ public class SqliteRow {
             } else {
                 builder.append(elementData.toString());
             }
+            semicolon = true;
         }        
         return builder.toString();
     }
@@ -93,6 +108,13 @@ public class SqliteRow {
         if (colIdx >= 0 && colIdx < rowData.length) {
             Object val = rowData[colIdx];
             if (val != null) {
+                if (val instanceof String) {
+                    /* a timestamp converted to a date string (Global.CONVERT_DATETIME) */
+                    Object raw = rawValue(colIdx);
+                    if (raw != null) {
+                        val = raw;
+                    }
+                }
                 if (val instanceof Long) {
                     result = (Long) val;
                 } else if (val instanceof Integer) {
@@ -143,6 +165,13 @@ public class SqliteRow {
         if (colIdx >= 0 && colIdx < rowData.length) {
             Object val = rowData[colIdx];
             if (val != null) {
+                if (val instanceof String) {
+                    /* a timestamp converted to a date string (Global.CONVERT_DATETIME) */
+                    Object raw = rawValue(colIdx);
+                    if (raw != null) {
+                        val = raw;
+                    }
+                }
                 if (val instanceof Double) {
                     result = (Double) val;
                 } else if (val instanceof Float) {

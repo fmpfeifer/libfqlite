@@ -168,13 +168,25 @@ public class SqliteInternalRow {
         result.setSource(source);
         result.setOffset(offset);
         Object [] data = new Object[rowData.size()];
+        Object [] raw = null;
         for (int i = 0; i < data.length; i++) {
             SqliteElementData d = rowData.get(i);
             if (d != null) {
                 data[i] = d.getObject();
+                if (data[i] instanceof String && Global.CONVERT_DATETIME) {
+                    /* keep the numeric value of values converted to a date string */
+                    Object value = d.getObject(false);
+                    if (value instanceof Number) {
+                        if (raw == null) {
+                            raw = new Object[data.length];
+                        }
+                        raw[i] = value;
+                    }
+                }
             }
         }
         result.setRowData(data);
+        result.setRawData(raw);
         
         return result;
     }
