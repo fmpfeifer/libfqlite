@@ -1494,16 +1494,48 @@ public class Job extends Base {
         }
     }
 
-    /**
-     * Key identifying a record: table, rowid and values.
-     */
-    private static String recordKey(SqliteInternalRow row) {
-        StringBuilder sb = new StringBuilder();
-        sb.append(row.getTableName()).append('\u0000').append(row.getRowId());
-        for (SqliteElementData d : row.getRowData()) {
-            sb.append('\u0000').append(d == null ? "" : d.rawKey());
+
+    private static final long FNV_OFFSET = 0xcbf29ce484222325L;
+    private static final long FNV_PRIME = 0x100000001b3L;
+
+    private static long hash(long h, String s) {
+        for (int i = 0; i < s.length(); i++) {
+            h ^= s.charAt(i);
+            h *= FNV_PRIME;
         }
-        return sb.toString();
+        return h;
+    }
+
+    private static long hash(long h, long v) {
+        for (int i = 0; i < 8; i++) {
+            h ^= (v >>> (8 * i)) & 0xFF;
+            h *= FNV_PRIME;
+        }
+        return h;
+    }
+
+    /** 64 bit hash of a value: its raw bytes (equal values have equal bytes in SQLite records). */
+    private static long hash(long h, SqliteElementData d) {
+        h = hash(h, 0x5A5AL);
+        byte[] b = d == null ? null : d.getBlobValue();
+        if (b == null || (b.length == 0 && d.getObject(false) == null))
+            return hash(h, -1L);
+        for (byte x : b) {
+            h ^= x & 0xFF;
+            h *= FNV_PRIME;
+        }
+        return hash(h, b.length);
+    }
+
+    /**
+     * Key identifying a record: table, rowid and values (64 bit hash).
+     */
+    private static long recordKey(SqliteInternalRow row) {
+        long h = hash(FNV_OFFSET, row.getTableName());
+        h = hash(h, row.getRowId());
+        for (SqliteElementData d : row.getRowData())
+            h = hash(h, d);
+        return h;
     }
 
     /**
@@ -1547,42 +1579,47 @@ public class Job extends Base {
 
         Map<Integer, Integer> currentFrames = wal != null ? wal.currentFrames() : Collections.emptyMap();
 
-        Set<String> current = new HashSet<>();
         Set<SqliteInternalRow> old = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         for (SqliteInternalRow row : rows) {
-            if (row.isDeletedRow())
-                continue;
-            if (isOldPageVersion(row, currentFrames))
+            if (!row.isDeletedRow() && isOldPageVersion(row, currentFrames))
                 old.add(row);
-            else
-                current.add(recordKey(row));
+        }
+        /* the keys of the current records are only needed if there are old page versions */
+        Set<Long> current = new HashSet<>();
+        if (!old.isEmpty()) {
+            for (SqliteInternalRow row : rows) {
+                if (!row.isDeletedRow() && !old.contains(row))
+                    current.add(recordKey(row));
+            }
         }
 
-        Set<String> reported = new HashSet<>();
+        Set<Long> reported = new HashSet<>();
         List<SqliteInternalRow> result = new ArrayList<>(rows.size());
         Set<Integer> indexPages = indexRecovery != null ? indexRecovery.attributedPages : Collections.emptySet();
+        boolean deletedRecords = false;
         for (SqliteInternalRow row : rows) {
             /* records of freelist pages attributed to an index are reported as index entries */
             if (!indexPages.isEmpty() && row.getSource() == RecordSource.DATABASE
                     && "__UNASSIGNED".equals(row.getTableName()) && indexPages.contains((int) (row.getOffset() / ps) + 1))
                 continue;
             if (old.contains(row)) {
-                String key = recordKey(row);
+                long key = recordKey(row);
                 /* a copy of a current record, or the same old record in several page versions */
                 if (current.contains(key) || !reported.add(key))
                     continue;
                 row.setRecordType(Global.DELETED_RECORD_IN_PAGE + row.getRecordType());
             }
+            deletedRecords |= row.isDeletedRow();
             result.add(row);
         }
 
         /* the values (and rowids) of the current records, to detect copies of them */
-        Map<String, Set<Long>> live = new HashMap<>();
-        if (!keepCopiesOfLiveRecords) {
+        Map<Long, Set<Long>> live = new HashMap<>();
+        if (!keepCopiesOfLiveRecords && deletedRecords) {
             for (SqliteInternalRow row : result) {
                 if (!row.isDeletedRow()) {
-                    String key = contentKey(row);
-                    if (key != null)
+                    long key = contentKey(row);
+                    if (key != NO_KEY)
                         live.computeIfAbsent(key, k -> new HashSet<>()).add(row.getRowId());
                 }
             }
@@ -1598,34 +1635,36 @@ public class Job extends Base {
             addRowNow(row);
     }
 
+    private static final long NO_KEY = Long.MIN_VALUE;
+
     /**
      * Key of the values of a record without the rowid (and the column alias for the rowid,
-     * which is usually lost for carved records), null if the record has less than two values.
+     * which is usually lost for carved records), NO_KEY if the record has less than two values.
      */
-    private String contentKey(SqliteInternalRow row) {
+    private long contentKey(SqliteInternalRow row) {
         int alias = -1;
         TableDescriptor td = headers.get(row.getTableName());
         if (td != null && td.rowidcolumn != null)
             alias = td.columnnames.indexOf(td.rowidcolumn);
-        StringBuilder sb = new StringBuilder(row.getTableName());
+        long h = hash(FNV_OFFSET, row.getTableName());
         int values = 0;
         List<SqliteElementData> data = row.getRowData();
         for (int i = 0; i < data.size(); i++) {
             if (i == alias)
                 continue;
             SqliteElementData d = data.get(i);
-            Object o = d == null ? null : d.getObject(false);
-            if (o != null)
+            byte[] b = d == null ? null : d.getBlobValue();
+            if (b != null && (b.length > 0 || d.getObject(false) != null))
                 values++;
-            sb.append('\u0000').append(d == null ? "" : d.rawKey());
+            h = hash(h, d);
         }
-        return values < 2 ? null : sb.toString();
+        return values < 2 ? NO_KEY : h;
     }
 
     /** A deleted record with the values of a current record (and the same rowid, if it is known). */
-    private boolean isCopyOfLiveRecord(SqliteInternalRow row, Map<String, Set<Long>> live) {
-        String key = contentKey(row);
-        if (key == null)
+    private boolean isCopyOfLiveRecord(SqliteInternalRow row, Map<Long, Set<Long>> live) {
+        long key = contentKey(row);
+        if (key == NO_KEY)
             return false;
         Set<Long> rowids = live.get(key);
         if (rowids == null)

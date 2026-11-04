@@ -37,7 +37,16 @@ import fqlite.types.SerialTypes;
 public class FreeblockReconstructor {
 
     /* maximum number of candidate cells evaluated for one freeblock */
-    private static final int MAX_CANDIDATES = 20000;
+    private static final int MAX_CANDIDATES = 3000;
+
+    /* maximum number of candidate cells evaluated for a freeblock with several cells */
+    private static final int MAX_CANDIDATES_MERGED = 10000;
+
+    /* maximum number of cells in one freeblock */
+    private static final int MAX_DEPTH = 64;
+
+    /* only consider cells filling the rest of the freeblock */
+    private boolean exactOnly = false;
 
     /* maximum text/blob length with a 1 or 2 byte serial type */
     private static final int MAX_LEN_1 = 57;
@@ -56,6 +65,7 @@ public class FreeblockReconstructor {
     private final Map<Integer, Map<Integer, Integer>> textLengths;
     private int budget;
     private boolean nullForVariable = true;
+    private CharsetDecoder decoder;
 
     private static boolean isVariableType(String type) {
         return "TEXT".equals(type) || "BLOB".equals(type) || "NUMERIC".equals(type);
@@ -179,10 +189,18 @@ public class FreeblockReconstructor {
     public List<SqliteInternalRow> reconstruct(int start, int end, long pageOffset) {
         if (columns == 0 || columns > 120 || td.isVirtual() || end > page.limit() || end - start < 4)
             return null;
-        budget = MAX_CANDIDATES;
         List<Cell> cells;
         try {
-            cells = solve(start, end, new HashMap<>(), 0);
+            /* first: one deleted cell filling the freeblock (the usual case, cheap) */
+            exactOnly = true;
+            budget = MAX_CANDIDATES;
+            cells = solve(start, end, new HashMap<>(), MAX_DEPTH);
+            if (cells == null) {
+                /* then: several deleted cells merged into one freeblock */
+                exactOnly = false;
+                budget = MAX_CANDIDATES_MERGED;
+                cells = solve(start, end, new HashMap<>(), 0);
+            }
         } catch (RuntimeException | IOException e) {
             return null;
         }
@@ -210,7 +228,7 @@ public class FreeblockReconstructor {
             return r == NO_SOLUTION ? null : r;
         }
         List<Cell> result = null;
-        if (depth < 64) {
+        if (depth < MAX_DEPTH || (exactOnly && depth == MAX_DEPTH)) {
             for (Cell c : candidates(pos, end)) {
                 /* a trailing fragment of less than 4 bytes belongs to the freeblock */
                 if (c.end >= end - 3 && c.end <= end) {
@@ -431,30 +449,27 @@ public class FreeblockReconstructor {
         }
     }
 
-    /** The possible lengths of a lost text/blob column (ascending). */
-    private List<Integer> lengths(int code) {
-        int col = code / 4, kind = code % 4;
-        String type = columnType(col);
-        List<Integer> r = new ArrayList<>();
-        if (kind == LOST_1) {
-            for (int len = 0; len <= MAX_LEN_1; len++)
-                r.add(len);
-        } else if (kind == LOST_2) {
-            for (int len = MAX_LEN_1 + 1; len <= MAX_LEN_2; len++)
-                r.add(len);
-        } else {
-            /* serial type = high * 128 + low byte; its parity tells text (odd) or blob (even) */
-            boolean text = lowByte % 2 == 1;
-            if ((text && "BLOB".equals(type)) || (!text && "TEXT".equals(type)))
-                return r;
-            for (int h = 1; h < 128; h++) {
-                long st = h * 128L + lowByte;
-                int len = (int) ((st - (text ? 13 : 12)) / 2);
-                if (len <= MAX_LEN_2)
-                    r.add(len);
-            }
-        }
-        return r;
+    /** Is len a possible length of the lost text/blob column? */
+    private boolean allowedLength(int code, int len) {
+        if (len < 0)
+            return false;
+        int kind = code % 4;
+        if (kind == LOST_1)
+            return len <= MAX_LEN_1;
+        if (kind == LOST_2)
+            return len > MAX_LEN_1 && len <= MAX_LEN_2;
+        /* serial type = high * 128 + low byte; its parity tells text (odd) or blob (even) */
+        String type = columnType(code / 4);
+        boolean text = lowByte % 2 == 1;
+        if ((text && "BLOB".equals(type)) || (!text && "TEXT".equals(type)))
+            return false;
+        long st = (text ? 13 : 12) + 2L * len;
+        return st >= 128 && st < 128 * 128 && (st & 0x7F) == lowByte && len <= MAX_LEN_2;
+    }
+
+    /** The largest possible length of the lost text/blob column. */
+    private int maxLength(int code) {
+        return code % 4 == LOST_1 ? MAX_LEN_1 : MAX_LEN_2;
     }
 
     private long lostSerial(int code, int len) {
@@ -482,35 +497,32 @@ public class FreeblockReconstructor {
         int exact = end - dataStart - fixed;
         if (nvariable == 1) {
             int col = variable[0] / 4;
-            List<Integer> lengths = lengths(variable[0]);
-            java.util.Set<Integer> allowed = new java.util.HashSet<>(lengths);
-            /* the length filling the freeblock first, then shorter cells */
-            List<Integer> order = new ArrayList<>();
-            for (int d = 0; d <= 3; d++) {
-                if (allowed.contains(exact - d))
-                    order.add(exact - d);
+            /* the length filling the freeblock first */
+            for (int d = 0; d <= 3 && budget > 0; d++) {
+                if (allowedLength(variable[0], exact - d)) {
+                    serials[col] = lostSerial(variable[0], exact - d);
+                    add(out, buildCell(pos, hp, hs, serials, end));
+                }
             }
-            for (int i = lengths.size() - 1; i >= 0; i--) {
-                if (lengths.get(i) <= exact - 4)
-                    order.add(lengths.get(i));
-            }
-            for (int len : order) {
-                if (budget <= 0)
-                    break;
-                serials[col] = lostSerial(variable[0], len);
-                add(out, buildCell(pos, hp, hs, serials, end));
+            /* then shorter cells (several deleted cells in one freeblock) */
+            if (!exactOnly) {
+                for (int len = Math.min(maxLength(variable[0]), exact - 4); len >= 0 && budget > 0; len--) {
+                    if (allowedLength(variable[0], len)) {
+                        serials[col] = lostSerial(variable[0], len);
+                        add(out, buildCell(pos, hp, hs, serials, end));
+                    }
+                }
             }
             serials[col] = -1;
             return;
         }
         /* two lost columns of unknown length: only the total is known (the cell fills the freeblock) */
         int col1 = variable[0] / 4, col2 = variable[1] / 4;
-        java.util.Set<Integer> allowed2 = new java.util.HashSet<>(lengths(variable[1]));
         int best = -1;
         double bestScore = 0, secondScore = 0;
-        for (int len1 : lengths(variable[0])) {
+        for (int len1 = 0; len1 <= Math.min(exact, maxLength(variable[0])); len1++) {
             int len2 = exact - len1;
-            if (len2 < 0 || !allowed2.contains(len2))
+            if (!allowedLength(variable[0], len1) || !allowedLength(variable[1], len2))
                 continue;
             double s = share(col1, len1) + share(col2, len2);
             if (s > bestScore) {
@@ -587,7 +599,10 @@ public class FreeblockReconstructor {
         } else {
             c.end = hp + c.payload;
         }
-        if (c.end > end || !valuesValid(c))
+        if (c.end > end)
+            return null;
+        /* invalid candidates must not use up the budget of the search */
+        if (!valuesValid(c))
             return null;
         return c;
     }
@@ -611,11 +626,28 @@ public class FreeblockReconstructor {
     }
 
     private boolean validText(int from, int len) {
+        /* fast path: printable ASCII is valid in UTF-8 */
+        if (job.db_encoding == java.nio.charset.StandardCharsets.UTF_8) {
+            boolean ascii = true;
+            for (int i = 0; i < len && ascii; i++) {
+                int ch = page.get(from + i) & 0xFF;
+                if (ch < 0x20 || ch > 0x7E) {
+                    if (ch == 0 || (ch < 0x20 && ch != '\n' && ch != '\r' && ch != '\t'))
+                        return false;
+                    ascii = ch < 0x80;
+                }
+            }
+            if (ascii)
+                return true;
+        }
         byte[] b = new byte[len];
         for (int i = 0; i < len; i++)
             b[i] = page.get(from + i);
-        CharsetDecoder dec = job.db_encoding.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        if (decoder == null)
+            decoder = job.db_encoding.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT);
+        CharsetDecoder dec = decoder;
+        dec.reset();
         try {
             CharSequence s = dec.decode(ByteBuffer.wrap(b));
             for (int i = 0; i < s.length(); i++) {

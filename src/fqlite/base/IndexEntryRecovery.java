@@ -103,27 +103,48 @@ final class IndexEntryRecovery {
             Collection<Integer> pages = leafPages.get(ix.id);
             if (pages == null)
                 continue;
-            for (int pn : pages) {
-                ByteBuffer page = job.readPageWithNumber(pn - 1, job.ps);
-                if (page == null)
-                    continue;
-                long pageOffset = (long) (pn - 1) * job.ps;
-                if (page.get(0) != 0x02 && page.get(0) != 0x0A)
-                    continue;
-                /* rebalancing leaves former cells in the unallocated area */
-                int header = page.get(0) == 0x02 ? 12 : 8;
-                int cells = page.getShort(3) & 0xFFFF;
-                int content = page.getShort(5) & 0xFFFF;
-                if (content == 0)
-                    content = 65536;
-                scanUnallocated(ix, page, header + 2 * cells, Math.min(content, page.limit()), pageOffset);
-                if (page.get(0) == 0x02) {
-                    recoverFromInteriorPage(ix, page, pageOffset);
-                    continue;
+            int threads = job.getNumberOfThreads();
+            if (threads > 0) {
+                java.util.concurrent.ForkJoinPool pool = new java.util.concurrent.ForkJoinPool(threads);
+                try {
+                    pool.submit(() -> pages.parallelStream().forEach(pn -> processIndexPage(ix, pn))).get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (java.util.concurrent.ExecutionException e) {
+                    job.err("Error while recovering index entries: ", e);
+                } finally {
+                    pool.shutdown();
                 }
-                FreeblockReconstructor.recoverFreeblocks(aux, page, ix.asTable, true, null, new BitSet(job.ps),
-                        pageOffset, RecordSource.DATABASE, entry -> addEntry(ix, entry));
+            } else {
+                for (int pn : pages)
+                    processIndexPage(ix, pn);
             }
+        }
+    }
+
+    private void processIndexPage(Index ix, int pn) {
+        try {
+            ByteBuffer page = job.readPageWithNumber(pn - 1, job.ps);
+            if (page == null)
+                return;
+            long pageOffset = (long) (pn - 1) * job.ps;
+            if (page.get(0) != 0x02 && page.get(0) != 0x0A)
+                return;
+            /* rebalancing leaves former cells in the unallocated area */
+            int header = page.get(0) == 0x02 ? 12 : 8;
+            int cells = page.getShort(3) & 0xFFFF;
+            int content = page.getShort(5) & 0xFFFF;
+            if (content == 0)
+                content = 65536;
+            scanUnallocated(ix, page, header + 2 * cells, Math.min(content, page.limit()), pageOffset);
+            if (page.get(0) == 0x02) {
+                recoverFromInteriorPage(ix, page, pageOffset);
+                return;
+            }
+            FreeblockReconstructor.recoverFreeblocks(aux, page, ix.asTable, true, null, new BitSet(job.ps),
+                    pageOffset, RecordSource.DATABASE, entry -> addEntry(ix, entry));
+        } catch (IOException | RuntimeException e) {
+            job.debug("Could not recover the index entries of page ", pn, ": ", e);
         }
     }
 
@@ -431,6 +452,8 @@ final class IndexEntryRecovery {
         }
         List<SqliteInternalRow> result = new ArrayList<>();
         Set<String> seen = new HashSet<>();
+        /* deterministic order (the pages are processed in parallel) */
+        rows.sort(java.util.Comparator.comparingLong(SqliteInternalRow::getOffset));
         for (SqliteInternalRow r : rows) {
             String t = r.getTableName();
             long rowid = r.getRowId();
