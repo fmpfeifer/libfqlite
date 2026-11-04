@@ -256,7 +256,7 @@ public class Job extends Base {
 		        if (page == null) {
 		            break;
 		        }
-		        readDBSchema(new LongPositionByteBufferWrapper(page), goBack, btsearch, bisearch, 1, true);
+		        readDBSchema(new LongPositionByteBufferWrapper(page), goBack, btsearch, bisearch, true);
 		    }
 		}
 	}
@@ -579,7 +579,7 @@ public class Job extends Base {
 			            ByteBuffer page = readPageWithNumber(pageNumber - 1, ps);
 			            if (page != null) {
 			                readDBSchema(new LongPositionByteBufferWrapper(page),
-			                    goBack, btsearch, bisearch, 1, true);
+			                    goBack, btsearch, bisearch, true);
 			            }
 			        }
 			);
@@ -591,7 +591,7 @@ public class Job extends Base {
 			 * 2. No information found but a WAL archive in place - try to get the
 			 *    missing information from the pages stored in the WAL archive
 			 */
-			readDBSchema(file, goback, btsearch, bisearch, 1, false);
+			readDBSchema(file, goback, btsearch, bisearch, false);
 			info("headers:::: ", headers.size());
 
 			if (headers.size() == 0 && readWAL) {
@@ -619,36 +619,37 @@ public class Job extends Base {
 						List<String> idname = id.columnnames;
 						List<String> tdnames = td.columnnames;
 
+						/* we need to find the missing column types - one type per index column */
 						for (int z = 0; z < idname.size(); z++) {
-
-							if (tdnames.contains(idname.get(z))) {
-								/* we need to find the missing column types */
-								try
-								{
-									int match = tdnames.indexOf(idname.get(z));
-									String type = td.getColumntypes().get(match);
-									id.columntypes.add(type);
-									info("ADDING IDX TYPE::: ", type, " FOR TABLE ", td.tblname, " INDEx ",
-											id.idxname);
-								}
-								catch(Exception err)
-								{
-									
-									id.columntypes.add("");
-								}
-								
-
+							int match = tdnames.indexOf(idname.get(z));
+							String type = null;
+							if (match >= 0 && match < td.getColumntypes().size()) {
+								type = td.getColumntypes().get(match);
 							}
-
+							/* expression or unknown column: NUMERIC matches any value */
+							id.columntypes.add(type == null || type.isEmpty() ? "NUMERIC" : type);
+							debug("ADDING IDX TYPE::: ", type, " FOR TABLE ", td.tblname, " INDEx ", id.idxname);
 						}
-						/**
-						 * The index contains data from the columns that you specify in the index and
-						 * the corresponding rowid value. This helps SQLite quickly locate the row based
-						 * on the values of the indexed columns.
-						 */
 
-						id.columnnames.add("rowid");
-						id.columntypes.add("INT");
+						if (td.ROWID) {
+							/**
+							 * The index contains data from the columns that you specify in the index and
+							 * the corresponding rowid value. This helps SQLite quickly locate the row based
+							 * on the values of the indexed columns.
+							 */
+							id.columnnames.add("rowid");
+							id.columntypes.add("INT");
+						} else {
+							/* WITHOUT ROWID table: the index holds the primary key columns instead of the rowid */
+							for (String pk : td.primarykeycolumns) {
+								if (!id.columnnames.contains(pk)) {
+									int match = tdnames.indexOf(pk);
+									String type = (match >= 0 && match < td.getColumntypes().size()) ? td.getColumntypes().get(match) : null;
+									id.columnnames.add(pk);
+									id.columntypes.add(type == null || type.isEmpty() ? "NUMERIC" : type);
+								}
+							}
+						}
 
 						/* HeadPattern !!! */
 						Auxiliary.addHeadPattern2Idx(id);
@@ -774,8 +775,8 @@ public class Job extends Base {
 
 				/* create a new threadpool to analyze the freepages */
 				ExecutorService executor = null;
-				if (Global.numberofThreads > 0) {
-					executor = Executors.newFixedThreadPool(Global.numberofThreads);
+				if (getNumberOfThreads() > 0) {
+					executor = Executors.newFixedThreadPool(getNumberOfThreads());
 				}
 
 				int freepagesum = 0;
@@ -926,12 +927,13 @@ public class Job extends Base {
                 err(e);
             }
         }
+	    resourcesToClose.clear();
 	}
 
 	/* number of bytes read before the text of the type column of a schema record */
 	private static final int SCHEMA_HEADER_BYTES = 9;
 
-	private void readDBSchema(LongPositionByteBuffer bb, int goback, ByteSeqSearcher btsearch, ByteSeqSearcher bisearch, int round, boolean isSinglePage) throws IOException {
+	private void readDBSchema(LongPositionByteBuffer bb, int goback, ByteSeqSearcher btsearch, ByteSeqSearcher bisearch, boolean isSinglePage) throws IOException {
 	    for (ByteSeqSearcher bsearch : new ByteSeqSearcher[] {btsearch, bisearch}) {
             
             long index = bsearch.indexOf(bb, 0);
@@ -1022,8 +1024,8 @@ public class Job extends Base {
 		info("Start with scan...");
 		/* create a new threadpool to analyze the freepages */
 		ExecutorService executor = null;
-		if (Global.numberofThreads > 0) {
-			executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(Global.numberofThreads);
+		if (getNumberOfThreads() > 0) {
+			executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(getNumberOfThreads());
 		}
 
 		long begin = System.currentTimeMillis();
@@ -1053,7 +1055,7 @@ public class Job extends Base {
 			}
 		}
 		if (executor != null) {
-			debug("Task total: ", runningTasks.intValue(), " worker threads ", Global.numberofThreads);
+			debug("Task total: ", runningTasks.intValue(), " worker threads ", getNumberOfThreads());
 		}
 		
 		int c = 1;
@@ -1104,6 +1106,26 @@ public class Job extends Base {
 	 */
 	public int getUsablePageSize() {
 		return ps - (reservedspace & 0xFF);
+	}
+
+	/* number of worker threads of this job, null: use Global.numberofThreads */
+	private Integer numberOfThreads = null;
+
+	/**
+	 * Set the number of worker threads used by this job (0: run in the calling thread).
+	 * By default, {@link Global#numberofThreads} is used.
+	 * 
+	 * @param numberOfThreads the number of worker threads
+	 */
+	public void setNumberOfThreads(int numberOfThreads) {
+		this.numberOfThreads = numberOfThreads;
+	}
+
+	/**
+	 * @return the number of worker threads used by this job
+	 */
+	public int getNumberOfThreads() {
+		return numberOfThreads != null ? numberOfThreads : Global.numberofThreads;
 	}
 
 	public void setPath(String path) {
@@ -1384,21 +1406,4 @@ public class Job extends Base {
     private interface BTreePageVisitor {
         void visitLeafPage(int pageNumber) throws IOException;
     }
-}
-
-
-
-
-class Signatures {
-
-	static String getTable(String signature) {
-
-		signature = signature.trim();
-
-		signature = signature.replaceAll("[0-9]", "");
-
-		signature = signature.replaceAll("PRIMARY_KEY", "");
-
-		return signature;
-	}
 }

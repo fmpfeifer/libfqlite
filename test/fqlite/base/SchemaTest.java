@@ -67,6 +67,27 @@ public class SchemaTest {
     }
 
     @Test
+    public void indexColumns() throws Exception {
+        Path db = TestSupport.createDb(tmp.getRoot().toPath(), "idx.db", c -> TestSupport.exec(c,
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER)", "CREATE INDEX i_expr ON t(lower(a), b)",
+                "CREATE TABLE w(k TEXT, n INTEGER, v TEXT, PRIMARY KEY(k, n)) WITHOUT ROWID",
+                "CREATE INDEX i_w ON w(v)", "INSERT INTO t VALUES(1, 'A', 2)", "INSERT INTO w VALUES('k', 1, 'v')"));
+        Job job = new Job();
+        job.setNumberOfThreads(0);
+        assertEquals(0, job.getNumberOfThreads());
+        assertEquals(0, job.run(db.toString()));
+        /* one type per column, rowid at the end */
+        fqlite.descriptor.IndexDescriptor expr = job.indices.get("i_expr");
+        assertEquals(expr.columnnames.size(), expr.columntypes.size());
+        assertEquals("rowid", expr.columnnames.get(expr.columnnames.size() - 1));
+        /* index of a WITHOUT ROWID table: primary key columns instead of the rowid */
+        fqlite.descriptor.IndexDescriptor iw = job.indices.get("i_w");
+        assertEquals(java.util.Arrays.asList("v", "k", "n"), iw.columnnames);
+        assertEquals(3, iw.columntypes.size());
+        assertEquals("v", job.getRowsForTable("w").get(0).getTextValue("v"));
+    }
+
+    @Test
     public void schemaOfUtf16Databases() throws Exception {
         for (String enc : new String[] { "UTF-16le", "UTF-16be" }) {
             Path db = TestSupport.createDb(tmp.getRoot().toPath(), enc + ".db", c -> TestSupport.exec(c,
