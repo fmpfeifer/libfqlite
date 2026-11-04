@@ -195,6 +195,9 @@ public class Job extends Base {
 
 	/* pages on the freelist (trunk and leaf pages) - they do not belong to any b-tree */
 	private Set<Integer> freelistPages = ConcurrentHashMap.newKeySet();
+
+	/* pages of all known b-trees (tables, indices and the schema) */
+	private Set<Integer> btreePages = ConcurrentHashMap.newKeySet();
 	
 	/* this array holds a description of the associated component for each data page, if known */
 	public AbstractDescriptor[] pages;
@@ -285,6 +288,7 @@ public class Job extends Base {
 
 		allreadyvisit = ConcurrentHashMap.newKeySet();
 		freelistPages.clear();
+		btreePages.clear();
 		List<TableDescriptor> recoveryTables = new LinkedList<>();
 
 		try {
@@ -704,6 +708,11 @@ public class Job extends Base {
 
 			/*******************************************************************/
 
+			/* mark all pages of the index b-trees (the descriptors are only assigned to the leaf root) */
+			for (IndexDescriptor id : indices.values()) {
+				exploreBTree(id.getRootOffset(), pageNumber -> { }, true);
+			}
+
 			for (IndexDescriptor id : indices.values()) {
 				int r = id.getRootOffset();
 				info(" root offset for index ", r);
@@ -1035,10 +1044,20 @@ public class Job extends Base {
 		
 		for (int cc = 1; cc < pages.length; cc++) {
 			
-			if (null == pages[cc] || freelistPages.contains(cc)) 
+			if (freelistPages.contains(cc) || (null == pages[cc] && btreePages.contains(cc)))
 			{
 				debug("page ", cc, " is no regular leaf page component. Maybe a indices or overflow or dropped component page.");
-				//System.out.println("page " + cc + " offset " + ((cc-1)*ps) + " is no regular leaf page component. Maybe a indices or overflow or dropped component page.");
+			}
+			else if (null == pages[cc])
+			{
+				/* not referenced by any b-tree nor by the freelist: e.g. the schema entry of its table was lost */
+				if (isUnreferencedTableLeaf(cc)) {
+					debug("page ", cc, " is an unreferenced table leaf page.");
+					RecoveryTask task = new RecoveryTask(aux, this, (long) (cc - 1) * ps, cc, ps, false, recoveryTables);
+					task.setUnreferencedPage(true);
+					tasks.add(task);
+					runningTasks.incrementAndGet();
+				}
 			} 
 			else 
 			{
@@ -1126,6 +1145,40 @@ public class Job extends Base {
 	 */
 	public int getNumberOfThreads() {
 		return numberOfThreads != null ? numberOfThreads : Global.numberofThreads;
+	}
+
+	/**
+	 * Check if a page looks like a table leaf page with a consistent page header.
+	 * Overflow pages and pointer map pages do not pass this test.
+	 * 
+	 * @param pagenumber the page number
+	 * @return true, if the page is a plausible table leaf page
+	 */
+	private boolean isUnreferencedTableLeaf(int pagenumber) throws IOException {
+		if (pagenumber == 1)
+			return false;
+		ByteBuffer page = readPageWithNumber(pagenumber - 1, ps);
+		if (page == null || page.get(0) != 0x0D)
+			return false;
+		int usable = getUsablePageSize();
+		int freeblock = page.getShort(1) & 0xFFFF;
+		int cells = page.getShort(3) & 0xFFFF;
+		int content = page.getShort(5) & 0xFFFF;
+		if (content == 0)
+			content = 65536;
+		int fragmented = page.get(7) & 0xFF;
+		int headerend = 8 + 2 * cells;
+		if (cells == 0 || headerend > content || content > usable || fragmented > 60)
+			return false;
+		if (freeblock != 0 && (freeblock < headerend || freeblock + 4 > usable))
+			return false;
+		/* all cells must be located in the cell content area */
+		for (int i = 0; i < cells; i++) {
+			int cell = page.getShort(8 + 2 * i) & 0xFFFF;
+			if (cell < content || cell >= usable)
+				return false;
+		}
+		return true;
 	}
 
 	public void setPath(String path) {
@@ -1266,6 +1319,7 @@ public class Job extends Base {
 
             if (pageNumber <= 0 || pageNumber > numberofpages || !visited.add(pageNumber))
                 continue;
+            btreePages.add(pageNumber);
 
             ByteBuffer buffer = readPageWithNumber(pageNumber - 1, ps);
             if (buffer == null)

@@ -32,6 +32,8 @@ public class RecoveryTask extends Base implements Runnable {
 	private Auxiliary ct;
     private StringBuffer firstcol = new StringBuffer(); 
     private boolean freeList = false;
+    /* page which is not referenced by any b-tree of the database nor by the freelist */
+    private boolean unreferencedPage = false;
     
 	/**
 	 * Constructor method.
@@ -60,6 +62,17 @@ public class RecoveryTask extends Base implements Runnable {
 		this.freeList = freeList;
 		this.tables = tables;
 		this.visit = new BitSet(pagesize);
+	}
+
+	/**
+	 * Mark the page as not referenced by any b-tree of the database nor by the freelist.
+	 * Records read from its cell pointer array are reported as
+	 * {@link Global#UNALLOCATED_SPACE} records.
+	 * 
+	 * @param unreferencedPage true, if the page is not referenced
+	 */
+	public void setUnreferencedPage(boolean unreferencedPage) {
+		this.unreferencedPage = unreferencedPage;
 	}
 
 	/**
@@ -258,6 +271,11 @@ public class RecoveryTask extends Base implements Runnable {
 					{    
 					   row.setRecordType(Global.FREELIST_ENTRY + row.getRecordType());
 					   
+					}
+					else if (unreferencedPage)
+					{
+					   /* not reachable from the database structure (e.g. lost schema entry) */
+					   row.setRecordType(Global.UNALLOCATED_SPACE + row.getRecordType());
 					}
 					job.addRow(row);
 				}
